@@ -49,6 +49,7 @@ export interface SlackTransport {
   onAction(handler: ActionHandler): void;
   onViewSubmit(handler: ViewSubmitHandler): void;
   onMessage(handler: MessageHandler): void;
+  onMention(handler: MentionHandler): void;
   onHomeOpened(handler: HomeHandler): void;
   onConnectionChange(handler: (connected: boolean) => void): void;
 }
@@ -83,7 +84,7 @@ export interface UpdateInput {
  * their own App Home, and a modal is opened for exactly one user against a
  * trigger_id. Neither carries a channel id at all.
  */
-export type InboundSurface = "conversation" | "home" | "modal";
+export type InboundSurface = "conversation" | "home" | "modal" | "mention";
 
 /** The normalised shape every handler sees, whatever the transport. */
 export interface InboundContext {
@@ -113,6 +114,7 @@ export type ActionHandler = (input: {
 }) => Promise<void>;
 
 export type MessageHandler = (input: { ctx: InboundContext; text: string }) => Promise<void>;
+export type MentionHandler = MessageHandler;
 
 export type HomeHandler = (input: { ctx: InboundContext }) => Promise<void>;
 

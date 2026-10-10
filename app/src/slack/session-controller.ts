@@ -96,7 +96,9 @@ export class SessionController {
     };
     const card = sessionCard(view, record);
 
-    if (record.slackThreadTs && record.slackChannel) {
+    const shared = record.slackChannel && this.deps.config.channelBindings?.[record.slackChannel] === pane.workspace_id;
+    if (record.slackThreadTs && record.slackChannel &&
+      (record.slackChannel === channel || (shared && channel.startsWith("D")))) {
       await transport
         .updateMessage({
           channel: record.slackChannel,
@@ -118,12 +120,21 @@ export class SessionController {
       return { ok: true, message: "Opened the existing thread for this agent." };
     }
 
+    const priorChannel = record.slackChannel;
+    const priorThread = record.slackThreadTs;
     const posted = await transport.postMessage({
       channel,
       text: card.text,
       blocks: card.blocks,
     });
     registry.setThread(terminalId, posted.channel, posted.ts);
+    if (priorChannel && priorThread && priorChannel !== posted.channel) {
+      await transport.updateMessage({
+        channel: priorChannel, ts: priorThread,
+        text: "Agent control moved to another channel.",
+        blocks: [{ type: "section", text: { type: "mrkdwn", text: "Agent control moved to another channel." } }],
+      }).catch(() => undefined);
+    }
     const bareLink = await transport.permalink(posted.channel, posted.ts).catch(() => "");
     await this.retitle(terminalId);
     const threadLink = resolveThreadPermalink(posted.channel, posted.ts, bareLink || undefined);

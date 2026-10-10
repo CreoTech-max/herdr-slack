@@ -93,6 +93,8 @@ export interface SurfacesDeps {
 export class Surfaces {
   #homeTimer: NodeJS.Timeout | null = null;
   #cardTimer: NodeJS.Timeout | null = null;
+  #channelTimer: NodeJS.Timeout | null = null;
+  #channelBusy = false;
   /** userId → DM channel, for interactions that arrive without one. */
   #dmChannels = new Map<string, string>();
   /** Who acted most recently, so a note can be addressed even deep in a helper. */
@@ -126,6 +128,7 @@ export class Surfaces {
       throttle: new ActionThrottle(),
       resolveRef: (ref) => deps.registry.terminalForRef(ref),
       isLive: (terminalId) => deps.state.paneByTerminal(terminalId) !== undefined,
+      workspaceForTerminal: (id) => deps.state.paneByTerminal(id)?.workspace_id,
       isHerdrConnected,
     };
   }
@@ -148,6 +151,7 @@ export class Surfaces {
     });
 
     // Bare DMs have no thread target; treat them as commands, not prompts.
+    transport.onMention(async ({ ctx, text }) => this.#mention(ctx, text));
     transport.onMessage(async ({ ctx, text }) => {
       this.#lastActor = ctx.userId;
       const decision = checkInbound(this.#guards, ctx);
@@ -164,7 +168,7 @@ export class Surfaces {
         return;
       }
       if (!this.#markMessageSeen(ctx)) return;
-      const terminalId = this.terminalForThread(ctx.threadTs);
+      const terminalId = this.terminalForThread(ctx.threadTs, ctx.channel);
       if (!terminalId) {
         await this.#ephemeral(
           ctx.channel,
@@ -187,10 +191,12 @@ export class Surfaces {
     state.on("changed", () => {
       void this.#reapDeadSessions();
       this.#scheduleHome();
+      this.#scheduleChannel();
     });
     tail.on("ready", () => {
       this.reconcileSessions();
       this.#scheduleHome();
+      this.#scheduleChannel();
     });
     // "synced Ns ago" tracks this, not the connect-time "ready" alone — a
     // healthy daemon that has been connected for hours without a hiccup was
@@ -226,6 +232,7 @@ export class Surfaces {
     });
 
     registry.load();
+    this.#scheduleChannel();
   }
 
   /**
@@ -605,6 +612,8 @@ export class Surfaces {
     this.#homeTimer = null;
     if (this.#cardTimer) clearTimeout(this.#cardTimer);
     this.#cardTimer = null;
+    if (this.#channelTimer) clearTimeout(this.#channelTimer);
+    this.#channelTimer = null;
     for (const timer of this.#agentGoneTimers.values()) clearTimeout(timer);
     this.#agentGoneTimers.clear();
     for (const timer of this.#cursorIdleTimers.values()) clearTimeout(timer);
@@ -790,6 +799,7 @@ export class Surfaces {
     const channel = await this.#replyChannel(ctx);
     const routed = this.#routeHerdRef(rawForAuth);
     if (routed.foreign) {
+      if (this.deps.config.channelBindings?.[ctx.channel]) return;
       const inbound = checkInbound(this.#guards, ctx);
       if (!inbound.allowed) {
         log(`action ${actionId} denied: ${inbound.reason}`);
@@ -894,9 +904,9 @@ export class Surfaces {
   }
 
   /** Which session owns a Slack thread, if any. */
-  terminalForThread(threadTs: string): string | undefined {
+  terminalForThread(threadTs: string, channel?: string): string | undefined {
     for (const [terminalId, record] of this.deps.registry.entries()) {
-      if (record.slackThreadTs === threadTs) return terminalId;
+      if (record.slackThreadTs === threadTs && (!channel || channel === record.slackChannel)) return terminalId;
     }
     return undefined;
   }
@@ -1049,6 +1059,85 @@ export class Surfaces {
     this.deps.registry.save();
     void this.#sessions.updateCard(terminalId);
     return undefined;
+  }
+
+  async #mention(ctx: InboundContext, text: string): Promise<void> {
+    const auth = checkInbound(this.#guards, ctx);
+    if (!auth.allowed || !this.#markMessageSeen(ctx)) return;
+    const { state, config, transport } = this.deps;
+    const workspaceId = config.channelBindings?.[ctx.channel];
+    if (!workspaceId || !state.workspaces.has(workspaceId) || !requireHerdr(this.#guards).allowed) return;
+    const tag = `<@${config.slack.botUserId}>`;
+    const clean = text.trimStart();
+    if (!clean.startsWith(tag)) return;
+    const instruction = clean.slice(tag.length).trim();
+    const cmd = instruction.toLowerCase();
+    const reply = async (msg: string) => {
+      await transport.postMessage({channel: ctx.channel, text: msg, ...(ctx.threadTs || ctx.ts ? {threadTs: ctx.threadTs || ctx.ts} : {})});
+    };
+    if (ctx.threadTs) {
+      const id = this.terminalForThread(ctx.threadTs, ctx.channel);
+      if (!id || state.paneByTerminal(id)?.workspace_id !== workspaceId) { await reply("Unknown agent thread."); return; }
+      if (cmd === "stop" || cmd === "end") { await reply("Use End session on the agent card."); return; }
+      const error = await this.#submitTurn(id, instruction);
+      if (error) await reply(error);
+      return;
+    }
+    if (["status", "agents", "blocked"].includes(cmd)) {
+      const panes = state.agentPanes().filter(p => p.workspace_id === workspaceId && (cmd !== "blocked" || p.agent_status === "blocked"));
+      await reply([`${panes.length} agents in workspace ${workspaceId}`, ...panes.slice(0,20).map(p => `${p.agent ?? "agent"}: ${p.agent_status} — ${p.terminal_title_stripped ?? "untitled"}`)].join("\\n"));
+      return;
+    }
+    if (cmd === "help" || !cmd) { await reply("Use @herdr status, @herdr blocked, @herdr start codex | task, or mention me in an agent thread."); return; }
+    const found = /^(?:start|new)\s+([a-z][a-z0-9_-]*)\s*\|\s*([\s\S]+)$/i.exec(instruction);
+    if (!found) { await reply("Unknown command; try @herdr help."); return; }
+    const kind = found[1] ?? "";
+    const firstPrompt = found[2]?.trim() ?? "";
+    const entry = findEntry(loadCatalog(), kind);
+    if (!entry || !firstPrompt) { await reply("Invalid agent kind or empty prompt."); return; }
+    const result = await launchAgent(this.deps.client, {
+      workspaceId, kind, mode: autoModeFor(entry),
+      name: sanitizeAgentName(`${kind}-${Date.now().toString(36)}`),
+      label: `Slack ${kind}`, firstPrompt,
+    });
+    await reply(result.ok ? `Started ${kind} in bound workspace.` : `Launch failed: ${result.message ?? "unknown"}`);
+    this.#scheduleChannel();
+  }
+
+  #scheduleChannel(): void {
+    if (this.#channelTimer || !Object.keys(this.deps.config.channelBindings ?? {}).length) return;
+    this.#channelTimer = setTimeout(() => {
+      this.#channelTimer = null;
+      void this.#syncChannel();
+    }, HOME_DEBOUNCE_MS);
+    this.#channelTimer.unref?.();
+  }
+
+  async #syncChannel(): Promise<void> {
+    if (this.#channelBusy || this.deps.tail.status !== "connected" || !this.deps.state.primed) return;
+    this.#channelBusy = true;
+    try {
+      const {state,config,registry,transport} = this.deps;
+      const bindings = Object.entries(config.channelBindings ?? {});
+      for (const pane of state.agentPanes()) {
+        const channel = bindings.find(([, id]) => id === pane.workspace_id)?.[0];
+        const old = registry.get(pane.terminal_id);
+        if (old?.slackChannel?.match(/^[CG]/) && old.slackChannel !== channel) {
+          if (old.slackThreadTs) await transport.updateMessage({channel:old.slackChannel,ts:old.slackThreadTs,text:"Agent moved. Card retired."}).catch(()=>undefined);
+          registry.clearThread(pane.terminal_id);
+        }
+        if (!channel) continue;
+        registry.upsert(pane.terminal_id, {
+          lastKnownPaneId:pane.pane_id, agentKind:pane.agent??"agent", title:pane.terminal_title_stripped??"",
+          cwd:pane.cwd??"",workspaceId:pane.workspace_id,tabId:pane.tab_id,lastStatus:state.statusOf(pane.terminal_id)??pane.agent_status,
+        });
+        const rec = registry.get(pane.terminal_id);
+        if (rec?.closedByUser || (rec?.slackChannel===channel && rec.slackThreadTs && !rec.ended)) continue;
+        if (!this.deps.budget.tryConsume()) break;
+        await this.#sessions.openSession(pane.terminal_id, channel).catch(e=>this.deps.log(String(e)));
+      }
+      registry.save();
+    } finally { this.#channelBusy = false; }
   }
 
   /** Handle bare DMs and agent-container suggested prompts as commands. */

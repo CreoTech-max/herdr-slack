@@ -236,6 +236,15 @@ export class SessionRegistry {
     record.slackThreadTs = threadTs;
   }
 
+  clearThread(terminalId: string): void {
+    const record = this.#byTerminal.get(terminalId);
+    if (!record) return;
+    delete record.slackChannel;
+    delete record.slackThreadTs;
+    delete record.slackPermalink;
+    delete record.threadTitle;
+  }
+
   markEnded(terminalId: string, now = Date.now(), closedByUser = false): SessionRecord | undefined {
     const record = this.#byTerminal.get(terminalId);
     if (!record || record.ended) return undefined;

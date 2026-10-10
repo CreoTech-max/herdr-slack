@@ -26,6 +26,8 @@ export interface InstanceConfig {
   slack: SlackCredentials;
   /** Empty means the daemon refuses to start. */
   allowedUsers: string[];
+  /** Slack channel ID (C/G...) -> stable local herdr workspace_id. */
+  channelBindings?: Record<string, string>;
   /** Conversations are refused outside DMs. Always true for new installs. */
   dmOnly: boolean;
   contentMode: ContentMode;
@@ -63,6 +65,7 @@ export function defaultInstance(overrides: Partial<InstanceConfig> = {}): Instan
     herdrSocketPath: "",
     slack: { botToken: "", appToken: "", teamId: "", appId: "", botUserId: "" },
     allowedUsers: [],
+    channelBindings: {},
     dmOnly: true,
     contentMode: "full",
     excludePaths: [],
@@ -192,6 +195,16 @@ export function validateInstance(instance: InstanceConfig): string[] {
   // Not a warning. Slack access is terminal access; an open bot is a shell for
   // anyone who can DM it.
   if (instance.allowedUsers.length === 0) problems.push("allowedUsers is empty");
+  const usedWorkspaces = new Set<string>();
+  for (const [channel, workspaceId] of Object.entries(instance.channelBindings ?? {})) {
+    if (!/^[CG][A-Z0-9]+$/.test(channel) || typeof workspaceId !== "string" || !workspaceId.trim()) {
+      problems.push(`invalid channel binding: ${channel}`);
+    }
+    if (usedWorkspaces.has(workspaceId)) {
+      problems.push(`workspace bound to multiple channels: ${workspaceId}`);
+    }
+    usedWorkspaces.add(workspaceId);
+  }
   if (instance.rateBudgetPerMin < 6) problems.push("rateBudgetPerMin is below the minimum (6/min)");
   return problems;
 }
