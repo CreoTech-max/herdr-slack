@@ -277,6 +277,7 @@ export class Surfaces {
       if (!record.slackThreadTs) continue;
       const pane = state.paneByTerminal(terminalId);
       if (pane?.agent) {
+        if (!isEligibleCreRoot(this.deps.config, pane)) continue;
         this.#clearAgentGoneTimer(terminalId);
         if (record.ended) {
           await this.#sessions.reviveIfLive(terminalId);
@@ -1103,7 +1104,7 @@ export class Surfaces {
       const id = this.terminalForThread(ctx.threadTs, ctx.channel);
       if (!id || state.paneByTerminal(id)?.workspace_id !== workspaceId ||
           !isEligibleCreRoot(config, state.paneByTerminal(id))) { await reply("Unknown or unverified CRE agent thread."); return; }
-      if (cmd === "stop" || cmd === "end") { await reply("Use End session on the agent card."); return; }
+      if (cmd === "stop" || cmd === "end") { await reply("End shared CRE roots directly in Herdr."); return; }
       const error = await this.#submitTurn(id, instruction);
       if (error) await reply(error);
       return;

@@ -7,6 +7,8 @@ const config = defaultInstance({
   allowedUsers: ["U0C93G42G00", "U0C8CR5CMSQ"],
   slack: { botToken: "xoxb-test", appToken: "xapp-test", teamId: "T1", appId: "A1", botUserId: "UBOT" },
   channelBindings: { C111: "w1", C222: "w2" },
+  creOnly: true,
+  creRoots: [{workspaceId:"w1",terminalId:"root1",sessionId:"native1"}],
 });
 
 describe("workspace-bound channel permissions", () => {

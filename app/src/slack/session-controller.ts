@@ -1,6 +1,7 @@
 import type { InstanceConfig } from "../config/config.js";
 import type { HerdrClient } from "../herdr/client.js";
 import type { SessionState } from "../herdr/state.js";
+import { isEligibleCreRoot } from "./cre-roots.js";
 import { HerdrError } from "../herdr/types.js";
 import type { SessionRegistry, TurnStatus } from "../registry/registry.js";
 import { resolveThreadPermalink } from "./links.js";
@@ -77,6 +78,7 @@ export class SessionController {
     const { state, registry, transport } = this.deps;
     const pane = state.paneByTerminal(terminalId);
     if (!pane) return { ok: false, message: "That session has ended." };
+    if (!isEligibleCreRoot(this.deps.config, pane)) return { ok: false, message: "Unverified CRE root." };
 
     const record = registry.get(terminalId);
     if (!record) return { ok: false, message: SESSION_OVER };
@@ -432,6 +434,7 @@ export class SessionController {
   /** Send free text as a prompt. herdr handles paste mode and the Enter. */
   async prompt(terminalId: string, text: string): Promise<ActionOutcome> {
     if (!this.isLive(terminalId)) return { ok: false, message: SESSION_OVER };
+    if (!isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId))) return { ok: false, message: "Unverified CRE root." };
     const paneId = this.#currentPane(terminalId);
     if (!paneId) return { ok: false, message: SESSION_OVER };
     try {
