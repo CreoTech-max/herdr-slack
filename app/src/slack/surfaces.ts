@@ -42,6 +42,7 @@ import {
   parseReplySubmission,
   skeletonModal,
 } from "./modals.js";
+import { isEligibleCreRoot } from "./cre-roots.js";
 import { SessionController } from "./session-controller.js";
 import { SESSION_ACTIONS } from "./session.js";
 import type { InboundContext, SlackTransport, ViewSubmitResult } from "./transport.js";
@@ -108,6 +109,7 @@ export class Surfaces {
   #cursorIdleTimers = new Map<string, NodeJS.Timeout>();
   /** Slack message deliveries already handled (`channel:ts` or event id). */
   #seenMessageKeys = new Set<string>();
+  #submitting = new Set<string>();
   /** userId → herd they drilled into on Home. Lost on restart, which is fine. */
   #homeSelection = new Map<string, string>();
 
@@ -129,6 +131,7 @@ export class Surfaces {
       resolveRef: (ref) => deps.registry.terminalForRef(ref),
       isLive: (terminalId) => deps.state.paneByTerminal(terminalId) !== undefined,
       workspaceForTerminal: (id) => deps.state.paneByTerminal(id)?.workspace_id,
+      isApprovedCreRoot: (id) => isEligibleCreRoot(deps.config, deps.state.paneByTerminal(id)),
       isHerdrConnected,
     };
   }
@@ -247,6 +250,7 @@ export class Surfaces {
   async #onTransition(terminalId: string, to: AgentStatus, from?: AgentStatus): Promise<void> {
     const record = this.deps.registry.get(terminalId);
     if (!record?.slackThreadTs || !record.slackChannel || record.ended) return;
+    if (!isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId))) return;
 
     if (to === "working" || to === "unknown") {
       if (to === "working") this.#clearCursorIdleTimer(terminalId);
@@ -319,7 +323,7 @@ export class Surfaces {
     const timer = setTimeout(() => {
       this.#cursorIdleTimers.delete(terminalId);
       const pane = this.deps.state.paneByTerminal(terminalId);
-      if (!pane || pane.agent_status !== "idle") return;
+      if (!pane || pane.agent_status !== "idle" || !isEligibleCreRoot(this.deps.config, pane)) return;
       const record = this.deps.registry.get(terminalId);
       if (!record?.slackThreadTs || !record.slackChannel || record.ended) return;
       void this.#sessions.refreshResponse(terminalId, "done");
@@ -386,6 +390,7 @@ export class Surfaces {
     // A launch may target a peer herd, so this daemon's own herdr being down is
     // not grounds to refuse it; the target's reachability is checked on arrival.
     if (callbackId === MODAL_IDS.newAgent) {
+      if (this.deps.config.creOnly) return;
       await this.#launchFromModal(
         ctx.userId,
         await this.#replyChannel(ctx),
@@ -550,6 +555,7 @@ export class Surfaces {
     view: unknown,
     privateMetadata = "",
   ): Promise<void> {
+    if (this.deps.config.creOnly) return;
     const submission = parseNewAgentSubmission(view, privateMetadata);
     if (!submission) {
       await this.#ephemeral(channel, "That form was missing an agent.");
@@ -626,6 +632,7 @@ export class Surfaces {
   reconcileSessions(): void {
     const { state, registry, log } = this.deps;
     for (const pane of state.agentPanes()) {
+      if (!isEligibleCreRoot(this.deps.config, pane)) continue;
       if (registry.get(pane.terminal_id)?.ended) {
         void this.#sessions.reviveIfLive(pane.terminal_id).then((ok) => {
           if (ok) registry.save();
@@ -642,7 +649,7 @@ export class Surfaces {
       });
     }
 
-    const live = new Set(state.agentPanes().map((pane) => pane.terminal_id));
+    const live = new Set(state.agentPanes().filter((pane) => isEligibleCreRoot(this.deps.config, pane)).map((pane) => pane.terminal_id));
     const result = sweepOrphans(registry, live, state.workspaces.size);
     if (result.skipped) {
       log("orphan sweep skipped: snapshot had no workspaces");
@@ -673,6 +680,7 @@ export class Surfaces {
     const localLabel = config.label || this.deps.instance;
     // Mint refs for new agents so Home buttons always carry a valid target.
     for (const pane of state.agentPanes()) {
+      if (!isEligibleCreRoot(config, pane)) continue;
       if (!registry.get(pane.terminal_id)) {
         registry.upsert(pane.terminal_id, {
           lastKnownPaneId: pane.pane_id,
@@ -685,7 +693,7 @@ export class Surfaces {
         });
       }
     }
-    const local = state.agentPanes().map((pane) => {
+    const local = state.agentPanes().filter((pane) => isEligibleCreRoot(config, pane)).map((pane) => {
       const record = registry.get(pane.terminal_id);
       const workspace = state.workspaces.get(pane.workspace_id);
       // Home only lists live panes, so an ended record here is one the user
@@ -710,7 +718,7 @@ export class Surfaces {
         },
       );
     });
-    return herd ? herd.homeAgents(local) : local;
+    return config.creOnly ? local : (herd ? herd.homeAgents(local) : local);
   }
 
   async publishHome(userId: string): Promise<void> {
@@ -734,6 +742,7 @@ export class Surfaces {
           slackConnected: transport.connected,
           herdrSyncedAgoMs: this.#lastSyncAt === null ? null : Date.now() - this.#lastSyncAt,
           role: herd?.role ?? "primary",
+          allowLaunch: !this.deps.config.creOnly,
         }),
       );
     } catch (error) {
@@ -799,7 +808,7 @@ export class Surfaces {
     const channel = await this.#replyChannel(ctx);
     const routed = this.#routeHerdRef(rawForAuth);
     if (routed.foreign) {
-      if (this.deps.config.channelBindings?.[ctx.channel]) return;
+      if (this.deps.config.creOnly || this.deps.config.channelBindings?.[ctx.channel]) return;
       const inbound = checkInbound(this.#guards, ctx);
       if (!inbound.allowed) {
         log(`action ${actionId} denied: ${inbound.reason}`);
@@ -838,6 +847,10 @@ export class Surfaces {
     }
     if (actionId === HOME_ACTIONS.refresh) {
       await this.#resyncHerdr(ctx.userId);
+      return;
+    }
+    if (this.deps.config.creOnly) {
+      await this.#ephemeral(await this.#replyChannel(ctx), "CRE-only mode: launch CRE in Herdr and pin its session.");
       return;
     }
     // A launch belongs to one herd, and it is the one whose view the button was
@@ -1009,6 +1022,10 @@ export class Surfaces {
         return;
       }
       case SESSION_ACTIONS.end: {
+        if (this.deps.config.creOnly) {
+          await this.#ephemeral(channel, "Close CRE roots directly in Herdr, not from Slack.");
+          return;
+        }
         const outcome = await this.#sessions.closeTerminal(terminalId);
         if (!outcome.ok) {
           await this.#ephemeral(channel, outcome.message ?? "That did not work.", {
@@ -1045,22 +1062,29 @@ export class Surfaces {
   async #submitTurn(terminalId: string, prompt: string): Promise<string | undefined> {
     const record = this.deps.registry.get(terminalId);
     if (!record || record.ended) return "That session has ended — reopen it from the Home tab.";
-    if (this.deps.registry.activeTurn(terminalId)) {
-      this.deps.log(`reply ignored for ${terminalId}: turn already active`);
+    if (!isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId))) {
+      return "This session is not a verified CRE root.";
+    }
+    if (this.#submitting.has(terminalId) || this.deps.registry.activeTurn(terminalId)) {
       return "This agent is still working on your last reply. Wait for it to finish.";
     }
-
-    const baseline = await this.#sessions.captureBaseline(terminalId);
-    const outcome = await this.#sessions.prompt(terminalId, prompt);
-    if (!outcome.ok) return outcome.message ?? "The prompt could not be delivered.";
-
-    const turn = this.deps.registry.startTurn(terminalId, prompt, baseline);
-    if (!turn) return "That session has ended — reopen it from the Home tab.";
-    this.deps.registry.save();
-    void this.#sessions.updateCard(terminalId);
-    return undefined;
+    this.#submitting.add(terminalId);
+    try {
+      const baseline = await this.#sessions.captureBaseline(terminalId);
+      if (!isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId))) {
+        return "This session is no longer a verified CRE root.";
+      }
+      const outcome = await this.#sessions.prompt(terminalId, prompt);
+      if (!outcome.ok) return outcome.message ?? "The prompt could not be delivered.";
+      const turn = this.deps.registry.startTurn(terminalId, prompt, baseline);
+      if (!turn) return "That session has ended — reopen it from the Home tab.";
+      this.deps.registry.save();
+      void this.#sessions.updateCard(terminalId);
+      return undefined;
+    } finally {
+      this.#submitting.delete(terminalId);
+    }
   }
-
   async #mention(ctx: InboundContext, text: string): Promise<void> {
     const auth = checkInbound(this.#guards, ctx);
     if (!auth.allowed || !this.#markMessageSeen(ctx)) return;
@@ -1077,18 +1101,20 @@ export class Surfaces {
     };
     if (ctx.threadTs) {
       const id = this.terminalForThread(ctx.threadTs, ctx.channel);
-      if (!id || state.paneByTerminal(id)?.workspace_id !== workspaceId) { await reply("Unknown agent thread."); return; }
+      if (!id || state.paneByTerminal(id)?.workspace_id !== workspaceId ||
+          !isEligibleCreRoot(config, state.paneByTerminal(id))) { await reply("Unknown or unverified CRE agent thread."); return; }
       if (cmd === "stop" || cmd === "end") { await reply("Use End session on the agent card."); return; }
       const error = await this.#submitTurn(id, instruction);
       if (error) await reply(error);
       return;
     }
     if (["status", "agents", "blocked"].includes(cmd)) {
-      const panes = state.agentPanes().filter(p => p.workspace_id === workspaceId && (cmd !== "blocked" || p.agent_status === "blocked"));
+      const panes = state.agentPanes().filter(p => p.workspace_id === workspaceId && isEligibleCreRoot(config, p) && (cmd !== "blocked" || p.agent_status === "blocked"));
       await reply([`${panes.length} agents in workspace ${workspaceId}`, ...panes.slice(0,20).map(p => `${p.agent ?? "agent"}: ${p.agent_status} — ${p.terminal_title_stripped ?? "untitled"}`)].join("\\n"));
       return;
     }
     if (cmd === "help" || !cmd) { await reply("Use @herdr status, @herdr blocked, @herdr start codex | task, or mention me in an agent thread."); return; }
+    if (config.creOnly) { await reply("CRE-only attach mode: start CRE manually in Herdr and pin its session."); return; }
     const found = /^(?:start|new)\s+([a-z][a-z0-9_-]*)\s*\|\s*([\s\S]+)$/i.exec(instruction);
     if (!found) { await reply("Unknown command; try @herdr help."); return; }
     const kind = found[1] ?? "";
@@ -1119,7 +1145,13 @@ export class Surfaces {
     try {
       const {state,config,registry,transport} = this.deps;
       const bindings = Object.entries(config.channelBindings ?? {});
+      for (const [terminalId, record] of registry.entries()) {
+        if (!config.creOnly || !record.slackChannel || isEligibleCreRoot(config, state.paneByTerminal(terminalId))) continue;
+        if (record.slackThreadTs) await transport.updateMessage({channel:record.slackChannel,ts:record.slackThreadTs,text:"CRE session identity changed. Thread detached."}).catch(()=>undefined);
+        registry.clearThread(terminalId);
+      }
       for (const pane of state.agentPanes()) {
+        if (!isEligibleCreRoot(config, pane)) continue;
         const channel = bindings.find(([, id]) => id === pane.workspace_id)?.[0];
         const old = registry.get(pane.terminal_id);
         if (old?.slackChannel?.match(/^[CG]/) && old.slackChannel !== channel) {
@@ -1202,7 +1234,7 @@ export class Surfaces {
     this.#cardTimer = setTimeout(() => {
       this.#cardTimer = null;
       for (const [terminalId, record] of this.deps.registry.entries()) {
-        if (record.ended || !record.slackThreadTs || !record.slackChannel) continue;
+        if (record.ended || !record.slackThreadTs || !record.slackChannel || !isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId))) continue;
         void this.#sessions.updateCard(terminalId);
       }
     }, HOME_DEBOUNCE_MS);
