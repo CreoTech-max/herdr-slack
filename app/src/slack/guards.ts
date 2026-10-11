@@ -11,6 +11,7 @@ export type DenyReason =
   | "session_ended"
   | "channel_not_permitted"
   | "workspace_mismatch"
+  | "cre_root_unverified"
   | "herdr_offline";
 
 export interface Decision {
@@ -29,6 +30,7 @@ const DENY_TEXT: Record<DenyReason, string> = {
   session_ended: "That session has ended.",
   channel_not_permitted: "This channel is not bound to a herdr workspace.",
   workspace_mismatch: "Agent belongs to another Herdr workspace.",
+  cre_root_unverified: "This is not an operator-verified CRE session.",
   herdr_offline:
     "Your computer is not reachable right now — wake it and keep herdr running to use Slack controls.",
 };
@@ -68,6 +70,7 @@ export interface GuardDeps {
   /** Whether a terminal is still live. */
   isLive?: (terminalId: string) => boolean;
   workspaceForTerminal?: (terminalId: string) => string | undefined;
+  isApprovedCreRoot?: (terminalId: string) => boolean;
   /**
    * Whether the herdr Unix socket is connected.
    *
@@ -136,6 +139,9 @@ export function authorizeAction(
   const workspaceId = deps.config.channelBindings?.[ctx.channel];
   if (workspaceId && deps.workspaceForTerminal?.(target.terminalId) !== workspaceId) {
     return { decision: deny("workspace_mismatch") };
+  }
+  if (deps.config.creOnly && deps.isApprovedCreRoot?.(target.terminalId) !== true) {
+    return { decision: deny("cre_root_unverified") };
   }
   return target;
 }

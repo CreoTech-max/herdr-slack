@@ -3,6 +3,7 @@ import type {
   EphemeralInput,
   HomeHandler,
   MessageHandler,
+  MentionHandler,
   PostInput,
   SlackTransport,
   UpdateInput,
@@ -136,6 +137,7 @@ export class DryRunTransport implements SlackTransport {
   onAction(_handler: ActionHandler): void {}
   onViewSubmit(_handler: ViewSubmitHandler): void {}
   onMessage(_handler: MessageHandler): void {}
+  onMention(_handler: MentionHandler): void {}
   onHomeOpened(_handler: HomeHandler): void {}
   onConnectionChange(handler: (connected: boolean) => void): void {
     handler(true);
