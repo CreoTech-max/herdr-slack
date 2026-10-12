@@ -12,8 +12,10 @@ export function isEligibleCreRoot(config: InstanceConfig, pane: PaneInfo | undef
   if (!config.creOnly) return true;
   const native = pane.agent_session;
   if (pane.agent !== "pi" || native?.agent !== "pi" || !native.value) return false;
-  return (config.creRoots ?? []).some((root) =>
-    root.workspaceId === pane.workspace_id && root.terminalId === pane.terminal_id &&
-    root.sessionId === native.value,
+  return (config.creRoots ?? []).some(
+    (root) =>
+      root.workspaceId === pane.workspace_id &&
+      root.terminalId === pane.terminal_id &&
+      root.sessionId === native.value,
   );
 }

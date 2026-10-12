@@ -1,8 +1,8 @@
 import type {
   ActionHandler,
   HomeHandler,
-  MessageHandler,
   MentionHandler,
+  MessageHandler,
   PostInput,
   SlackTransport,
   UpdateInput,

@@ -210,7 +210,11 @@ export function validateInstance(instance: InstanceConfig): string[] {
   if (instance.allowedUsers.length === 0) problems.push("allowedUsers is empty");
   const usedWorkspaces = new Set<string>();
   for (const [channel, workspaceId] of Object.entries(instance.channelBindings ?? {})) {
-    if (!/^[CG][A-Z0-9]+$/.test(channel) || typeof workspaceId !== "string" || !workspaceId.trim()) {
+    if (
+      !/^[CG][A-Z0-9]+$/.test(channel) ||
+      typeof workspaceId !== "string" ||
+      !workspaceId.trim()
+    ) {
       problems.push(`invalid channel binding: ${channel}`);
     }
     if (usedWorkspaces.has(workspaceId)) {
@@ -220,21 +224,34 @@ export function validateInstance(instance: InstanceConfig): string[] {
   }
   const bound = Object.values(instance.channelBindings ?? {});
   if (bound.length && !instance.creOnly) problems.push("channelBindings requires creOnly=true");
-  if (instance.creOnly && !instance.creRoots?.length) problems.push("creOnly requires at least one pinned creRoots entry");
+  if (instance.creOnly && !instance.creRoots?.length)
+    problems.push("creOnly requires at least one pinned creRoots entry");
+  validateCreRoots(instance, bound, problems);
+  if (instance.rateBudgetPerMin < 6) problems.push("rateBudgetPerMin is below the minimum (6/min)");
+  return problems;
+}
+
+function validateCreRoots(instance: InstanceConfig, bound: string[], problems: string[]): void {
   const terminals = new Set<string>();
   for (const root of instance.creRoots ?? []) {
-    if (!root || typeof root.workspaceId !== "string" || !root.workspaceId.trim() ||
-        typeof root.terminalId !== "string" || !root.terminalId.trim() ||
-        typeof root.sessionId !== "string" || !root.sessionId.trim()) {
+    if (
+      !root ||
+      typeof root.workspaceId !== "string" ||
+      !root.workspaceId.trim() ||
+      typeof root.terminalId !== "string" ||
+      !root.terminalId.trim() ||
+      typeof root.sessionId !== "string" ||
+      !root.sessionId.trim()
+    ) {
       problems.push("creRoots contains an incomplete binding");
       continue;
     }
-    if (bound.length && !bound.includes(root.workspaceId)) problems.push(`creRoot refers to an unbound workspace: ${root.workspaceId}`);
-    if (terminals.has(root.terminalId)) problems.push(`duplicate creRoot terminal: ${root.terminalId}`);
+    if (bound.length && !bound.includes(root.workspaceId))
+      problems.push(`creRoot refers to an unbound workspace: ${root.workspaceId}`);
+    if (terminals.has(root.terminalId))
+      problems.push(`duplicate creRoot terminal: ${root.terminalId}`);
     terminals.add(root.terminalId);
   }
-  if (instance.rateBudgetPerMin < 6) problems.push("rateBudgetPerMin is below the minimum (6/min)");
-  return problems;
 }
 
 export function writeConfigFile(config: Config, file = configPath()): void {

@@ -275,7 +275,8 @@ export function buildHome(model: HomeModel): Block[] {
   // Launching belongs to a herd, not to the overview. Everything the form asks
   // for — workspace, directory, agent kind — is one machine's, so the button
   // lives where a machine is already in view and the answer is not a guess.
-  const canLaunch = model.allowLaunch !== false && selected !== null && selected.herdrStatus === "connected";
+  const canLaunch =
+    model.allowLaunch !== false && selected !== null && selected.herdrStatus === "connected";
 
   const title = selected
     ? `🐑 Herd · ${selected.label || selected.instance}`
@@ -330,9 +331,11 @@ export function buildHome(model: HomeModel): Block[] {
     return [
       ...blocks,
       section("*No agents running.*"),
-      context(model.allowLaunch === false
-        ? "Start CRE manually in Herdr and pin its terminal and native session in creRoots."
-        : "Tap *＋ New agent* above, or start one in herdr and it will appear here."),
+      context(
+        model.allowLaunch === false
+          ? "Start CRE manually in Herdr and pin its terminal and native session in creRoots."
+          : "Tap *＋ New agent* above, or start one in herdr and it will appear here.",
+      ),
       divider(),
       livenessFooter(model),
     ];

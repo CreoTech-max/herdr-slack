@@ -16,7 +16,12 @@ export const BASE_SCOPES = [
 ] as const;
 
 /** Sent when the user switches the agent pane's channel/thread context. */
-export const BASE_EVENTS = ["app_home_opened", "app_context_changed", "message.im", "app_mention"] as const;
+export const BASE_EVENTS = [
+  "app_home_opened",
+  "app_context_changed",
+  "message.im",
+  "app_mention",
+] as const;
 
 export function scopesFor(_options: ManifestOptions): string[] {
   return [...BASE_SCOPES];
