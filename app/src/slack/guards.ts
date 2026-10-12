@@ -10,6 +10,8 @@ export type DenyReason =
   | "unknown_ref"
   | "session_ended"
   | "channel_not_permitted"
+  | "workspace_mismatch"
+  | "cre_root_unverified"
   | "herdr_offline";
 
 export interface Decision {
@@ -26,7 +28,9 @@ const DENY_TEXT: Record<DenyReason, string> = {
   throttled: "Too many actions in a row — wait a moment and try again.",
   unknown_ref: "That button is from an older message and no longer works.",
   session_ended: "That session has ended.",
-  channel_not_permitted: "This bot only takes commands in a direct message.",
+  channel_not_permitted: "This channel is not bound to a herdr workspace.",
+  workspace_mismatch: "Agent belongs to another Herdr workspace.",
+  cre_root_unverified: "This is not an operator-verified CRE session.",
   herdr_offline:
     "Your computer is not reachable right now — wake it and keep herdr running to use Slack controls.",
 };
@@ -65,6 +69,8 @@ export interface GuardDeps {
   resolveRef?: (ref: string) => string | undefined;
   /** Whether a terminal is still live. */
   isLive?: (terminalId: string) => boolean;
+  workspaceForTerminal?: (terminalId: string) => string | undefined;
+  isApprovedCreRoot?: (terminalId: string) => boolean;
   /**
    * Whether the herdr Unix socket is connected.
    *
@@ -81,10 +87,10 @@ export function checkInbound(deps: GuardDeps, ctx: InboundContext): Decision {
   if (!ctx.teamId || ctx.teamId !== config.slack.teamId) return deny("wrong_team");
   if (!ctx.userId || !config.allowedUsers.includes(ctx.userId)) return deny("not_allowed");
 
-  // dmOnly applies to conversations only — Home/modals have no channel id.
-  // Absent surface defaults to conversation (fail closed).
+  const bound = Object.hasOwn(config.channelBindings ?? {}, ctx.channel);
+  if (ctx.surface === "mention" && !bound) return deny("channel_not_permitted");
   if ((ctx.surface ?? "conversation") === "conversation" && config.dmOnly) {
-    if (!ctx.channel.startsWith("D")) return deny("channel_not_permitted");
+    if (!ctx.channel.startsWith("D") && !bound) return deny("channel_not_permitted");
   }
 
   if (!throttle.check(ctx.userId)) return deny("throttled");
@@ -128,5 +134,14 @@ export function authorizeAction(
   if (!inbound.allowed) return { decision: inbound };
   const herdr = requireHerdr(deps);
   if (!herdr.allowed) return { decision: herdr };
-  return resolveTarget(deps, ref);
+  const target = resolveTarget(deps, ref);
+  if (!target.decision.allowed || !target.terminalId) return target;
+  const workspaceId = deps.config.channelBindings?.[ctx.channel];
+  if (workspaceId && deps.workspaceForTerminal?.(target.terminalId) !== workspaceId) {
+    return { decision: deny("workspace_mismatch") };
+  }
+  if (deps.config.creOnly && deps.isApprovedCreRoot?.(target.terminalId) !== true) {
+    return { decision: deny("cre_root_unverified") };
+  }
+  return target;
 }

@@ -58,6 +58,7 @@ describe("manifest", () => {
       "app_home_opened",
       "app_context_changed",
       "message.im",
+      "app_mention",
     ]);
   });
 

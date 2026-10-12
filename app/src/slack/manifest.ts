@@ -12,10 +12,16 @@ export const BASE_SCOPES = [
   "im:write", // open the DM in the first place
   "im:read",
   "assistant:write", // agent timeline titles via setThreadTitle
+  "app_mentions:read", // explicit @herdr commands in bound channels
 ] as const;
 
 /** Sent when the user switches the agent pane's channel/thread context. */
-export const BASE_EVENTS = ["app_home_opened", "app_context_changed", "message.im"] as const;
+export const BASE_EVENTS = [
+  "app_home_opened",
+  "app_context_changed",
+  "message.im",
+  "app_mention",
+] as const;
 
 export function scopesFor(_options: ManifestOptions): string[] {
   return [...BASE_SCOPES];
@@ -107,4 +113,5 @@ const SCOPE_REASON: Record<string, string> = {
   "im:write": "open a DM with me",
   "im:read": "resolve the DM channel",
   "assistant:write": "title agent timeline threads",
+  "app_mentions:read": "accept explicit mentions in bound channels",
 };

@@ -103,6 +103,23 @@ describe("checkInbound", () => {
     expect(checkInbound(deps(), ctx({ channel: "" })).reason).toBe("channel_not_permitted");
   });
 
+  it("refuses a mention when the instance has no channel bindings field", () => {
+    const { channelBindings, ...withoutBindings } = config();
+    expect(channelBindings).toEqual({});
+    expect(
+      checkInbound(deps({ config: withoutBindings }), ctx({ channel: "C1", surface: "mention" }))
+        .reason,
+    ).toBe("channel_not_permitted");
+  });
+
+  it("accepts a bound conversation channel for an allowlisted member", () => {
+    const d = deps({ config: config({ channelBindings: { C1: "w1" } }) });
+    expect(checkInbound(d, ctx({ channel: "C1", surface: "conversation" })).allowed).toBe(true);
+    expect(checkInbound(d, ctx({ channel: "C2", surface: "conversation" })).reason).toBe(
+      "channel_not_permitted",
+    );
+  });
+
   it("still refuses a public channel even when surface is explicit", () => {
     expect(checkInbound(deps(), ctx({ channel: "C1", surface: "conversation" })).reason).toBe(
       "channel_not_permitted",

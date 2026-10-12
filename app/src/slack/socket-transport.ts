@@ -12,6 +12,7 @@ import type {
   EphemeralInput,
   HomeHandler,
   InboundContext,
+  MentionHandler,
   MessageHandler,
   PostInput,
   SlackTransport,
@@ -322,6 +323,28 @@ export class SocketModeTransport implements SlackTransport {
           userId: str(record.user),
           channel: str(record.channel),
           surface: "conversation",
+          ts: str(record.ts),
+          ...(record.thread_ts ? { threadTs: str(record.thread_ts) } : {}),
+          ...(str(envelope.event_id) ? { eventId: str(envelope.event_id) } : {}),
+          ...(typeof context.retryNum === "number" ? { retryNum: context.retryNum } : {}),
+        },
+        text: str(record.text),
+      });
+    });
+  }
+
+  onMention(handler: MentionHandler): void {
+    this.#app.event("app_mention", async ({ event, body, context }) => {
+      this.#touch();
+      const record = toRecord(event);
+      if (!isActionableMessage(record, this.config.slack.botUserId)) return;
+      const envelope = toRecord(body);
+      await handler({
+        ctx: {
+          teamId: str(record.team) || str(envelope.team_id),
+          userId: str(record.user),
+          channel: str(record.channel),
+          surface: "mention",
           ts: str(record.ts),
           ...(record.thread_ts ? { threadTs: str(record.thread_ts) } : {}),
           ...(str(envelope.event_id) ? { eventId: str(envelope.event_id) } : {}),

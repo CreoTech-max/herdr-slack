@@ -101,7 +101,9 @@ describe("PeerDirectory", () => {
   it("never throws when the machine will not have it", () => {
     // A locked-down /Users/Shared must degrade to "no discovery", not to a
     // daemon that cannot boot.
-    const peers = new PeerDirectory(KEY, "/proc/nope/peers");
+    const blocked = path.join(scratch(), "not-a-directory");
+    writeFileSync(blocked, "");
+    const peers = new PeerDirectory(KEY, path.join(blocked, "peers"));
     expect(peers.publish(pointer())).toBe(false);
     expect(peers.peers(APP_HASH, "mac:me:default")).toEqual([]);
   });
