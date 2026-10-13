@@ -35,11 +35,11 @@ describe("manifest", () => {
     expect(parsed.features.app_home.home_tab_enabled).toBe(true);
   });
 
-  it("requests only DM scopes", () => {
+  it("requests channel and group history scopes for context", () => {
     const scopes = scopesFor({ appName: "Herdr" });
     expect(scopes).toEqual([...BASE_SCOPES]);
-    expect(scopes).not.toContain("channels:history");
-    expect(scopes).not.toContain("groups:history");
+    expect(scopes).toContain("channels:history");
+    expect(scopes).toContain("groups:history");
     expect(scopes).not.toContain("users:read");
     expect(scopes).not.toContain("commands");
   });
@@ -59,6 +59,8 @@ describe("manifest", () => {
       "app_context_changed",
       "message.im",
       "app_mention",
+      "message.channels",
+      "message.groups",
     ]);
   });
 

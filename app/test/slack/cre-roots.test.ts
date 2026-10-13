@@ -53,14 +53,14 @@ describe("attach-only CRE roots", () => {
       authorizeAction({ ...deps, isApprovedCreRoot: () => true }, ctx, "ref").decision.allowed,
     ).toBe(true);
   });
-  it("rejects missing root pins and unbound channels during startup validation", () => {
+  it("requires root pins only in creOnly mode", () => {
     expect(validateInstance(config)).not.toContain(
       "creOnly requires at least one pinned creRoots entry",
     );
     expect(validateInstance({ ...config, creRoots: [] })).toContain(
       "creOnly requires at least one pinned creRoots entry",
     );
-    expect(validateInstance({ ...config, creOnly: false })).toContain(
+    expect(validateInstance({ ...config, creOnly: false })).not.toContain(
       "channelBindings requires creOnly=true",
     );
   });

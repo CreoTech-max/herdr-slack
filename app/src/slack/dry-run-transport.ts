@@ -1,6 +1,7 @@
 import type {
   ActionHandler,
   EphemeralInput,
+  HistoryMessage,
   HomeHandler,
   MentionHandler,
   MessageHandler,
@@ -77,6 +78,13 @@ export class DryRunTransport implements SlackTransport {
     return `dry-${prefix}-${this.#counter}`;
   }
 
+  async history(
+    _channel: string,
+    _opts: { threadTs?: string; limit: number },
+  ): Promise<HistoryMessage[]> {
+    return [];
+  }
+
   async postMessage(input: PostInput): Promise<{ ts: string; channel: string }> {
     this.#record({
       api: "chat.postMessage",
@@ -109,6 +117,7 @@ export class DryRunTransport implements SlackTransport {
       api: "chat.postEphemeral",
       target: input.threadTs ? `${input.channel} thread ${input.threadTs}` : input.channel,
       text: input.text,
+      ...(input.blocks ? { blocks: input.blocks } : {}),
     });
   }
 

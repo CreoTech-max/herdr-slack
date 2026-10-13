@@ -88,7 +88,6 @@ export function checkInbound(deps: GuardDeps, ctx: InboundContext): Decision {
   if (!ctx.userId || !config.allowedUsers.includes(ctx.userId)) return deny("not_allowed");
 
   const bound = Object.hasOwn(config.channelBindings ?? {}, ctx.channel);
-  if (ctx.surface === "mention" && !bound) return deny("channel_not_permitted");
   if ((ctx.surface ?? "conversation") === "conversation" && config.dmOnly) {
     if (!ctx.channel.startsWith("D") && !bound) return deny("channel_not_permitted");
   }
@@ -137,7 +136,11 @@ export function authorizeAction(
   const target = resolveTarget(deps, ref);
   if (!target.decision.allowed || !target.terminalId) return target;
   const workspaceId = deps.config.channelBindings?.[ctx.channel];
-  if (workspaceId && deps.workspaceForTerminal?.(target.terminalId) !== workspaceId) {
+  if (
+    !ctx.channel.startsWith("D") &&
+    workspaceId &&
+    deps.workspaceForTerminal?.(target.terminalId) !== workspaceId
+  ) {
     return { decision: deny("workspace_mismatch") };
   }
   if (deps.config.creOnly && deps.isApprovedCreRoot?.(target.terminalId) !== true) {

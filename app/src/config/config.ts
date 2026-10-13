@@ -44,6 +44,7 @@ export interface InstanceConfig {
   contentMode: ContentMode;
   excludePaths: string[];
   rateBudgetPerMin: number;
+  contextMessages?: number;
   /**
    * Shared directory where every daemon for this Slack app writes heartbeats.
    *
@@ -83,6 +84,7 @@ export function defaultInstance(overrides: Partial<InstanceConfig> = {}): Instan
     contentMode: "full",
     excludePaths: [],
     rateBudgetPerMin: 18,
+    contextMessages: 50,
     ...overrides,
   };
 }
@@ -223,10 +225,16 @@ export function validateInstance(instance: InstanceConfig): string[] {
     usedWorkspaces.add(workspaceId);
   }
   const bound = Object.values(instance.channelBindings ?? {});
-  if (bound.length && !instance.creOnly) problems.push("channelBindings requires creOnly=true");
   if (instance.creOnly && !instance.creRoots?.length)
     problems.push("creOnly requires at least one pinned creRoots entry");
   validateCreRoots(instance, bound, problems);
+  if (
+    instance.contextMessages !== undefined &&
+    (!Number.isInteger(instance.contextMessages) ||
+      instance.contextMessages < 1 ||
+      instance.contextMessages > 999)
+  )
+    problems.push("contextMessages must be between 1 and 999");
   if (instance.rateBudgetPerMin < 6) problems.push("rateBudgetPerMin is below the minimum (6/min)");
   return problems;
 }

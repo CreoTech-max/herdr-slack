@@ -103,13 +103,18 @@ describe("checkInbound", () => {
     expect(checkInbound(deps(), ctx({ channel: "" })).reason).toBe("channel_not_permitted");
   });
 
-  it("refuses a mention when the instance has no channel bindings field", () => {
+  it("allows an unbound mention, but still pins team, allowlist and throttle", () => {
     const { channelBindings, ...withoutBindings } = config();
     expect(channelBindings).toEqual({});
-    expect(
-      checkInbound(deps({ config: withoutBindings }), ctx({ channel: "C1", surface: "mention" }))
-        .reason,
-    ).toBe("channel_not_permitted");
+    const d = deps({ config: withoutBindings, throttle: new ActionThrottle(1) });
+    const mention = ctx({ channel: "C1", surface: "mention" });
+    expect(checkInbound(d, ctx({ ...mention, teamId: "T_OTHER" })).reason).toBe("wrong_team");
+    expect(checkInbound(d, ctx({ ...mention, userId: "U_OTHER" })).reason).toBe("not_allowed");
+    expect(checkInbound(d, mention).allowed).toBe(true);
+    expect(checkInbound(d, mention).reason).toBe("throttled");
+    expect(checkInbound(deps({ config: withoutBindings }), ctx({ channel: "C1" })).reason).toBe(
+      "channel_not_permitted",
+    );
   });
 
   it("accepts a bound conversation channel for an allowlisted member", () => {
@@ -190,6 +195,24 @@ describe("resolveTarget", () => {
 });
 
 describe("authorizeAction", () => {
+  it("allows bound DM card actions outside its workspace but preserves all other guards", () => {
+    const d = deps({
+      config: config({ channelBindings: { D1: "w1" } }),
+      workspaceForTerminal: () => "w2",
+    });
+    expect(authorizeAction(d, ctx(), "good").decision.allowed).toBe(true);
+    expect(authorizeAction(d, ctx({ teamId: "T_OTHER" }), "good").decision.reason).toBe(
+      "wrong_team",
+    );
+    expect(authorizeAction(d, ctx(), "missing").decision.reason).toBe("unknown_ref");
+    expect(authorizeAction({ ...d, isLive: () => false }, ctx(), "good").decision.reason).toBe(
+      "session_ended",
+    );
+    expect(
+      authorizeAction({ ...d, isHerdrConnected: () => false }, ctx(), "good").decision.reason,
+    ).toBe("herdr_offline");
+  });
+
   it("passes both gates for a legitimate action", () => {
     const result = authorizeAction(deps(), ctx(), "good");
     expect(result.decision.allowed).toBe(true);

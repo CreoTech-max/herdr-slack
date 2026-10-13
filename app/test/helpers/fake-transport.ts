@@ -1,5 +1,7 @@
 import type {
   ActionHandler,
+  EphemeralInput,
+  HistoryMessage,
   HomeHandler,
   MentionHandler,
   MessageHandler,
@@ -24,7 +26,23 @@ export class FakeTransport implements SlackTransport {
   readonly updated: UpdateInput[] = [];
   readonly homes: { userId: string; blocks: unknown[] }[] = [];
 
-  readonly ephemerals: { channel: string; user: string; text: string; threadTs?: string }[] = [];
+  readonly ephemerals: {
+    channel: string;
+    user: string;
+    text: string;
+    threadTs?: string;
+    blocks?: unknown[];
+  }[] = [];
+  historyMessages: HistoryMessage[] = [];
+  historyError?: string;
+
+  async history(
+    _channel: string,
+    _opts: { threadTs?: string; limit: number },
+  ): Promise<HistoryMessage[]> {
+    if (this.historyError) throw new Error(this.historyError);
+    return this.historyMessages;
+  }
   readonly titles: { channel: string; threadTs: string; title: string }[] = [];
   readonly modals: { triggerId: string; view: Record<string, unknown> }[] = [];
   readonly modalUpdates: { viewId: string; view: Record<string, unknown> }[] = [];
@@ -67,12 +85,7 @@ export class FakeTransport implements SlackTransport {
     return `D_${userId}`;
   }
 
-  async postEphemeral(input: {
-    channel: string;
-    user: string;
-    text: string;
-    threadTs?: string;
-  }): Promise<void> {
+  async postEphemeral(input: EphemeralInput): Promise<void> {
     this.ephemerals.push(input);
   }
 

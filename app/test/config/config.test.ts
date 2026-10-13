@@ -211,6 +211,20 @@ describe("validateInstance", () => {
     expect(validateInstance({ ...ok(), rateBudgetPerMin: 3 })).toHaveLength(1);
   });
 
+  it("permits channel bindings without creOnly and validates context message bounds", () => {
+    expect(validateInstance({ ...ok(), channelBindings: { C123: "w1" }, creOnly: false })).toEqual(
+      [],
+    );
+    expect(defaultInstance().contextMessages).toBe(50);
+    expect(validateInstance({ ...ok(), contextMessages: 0 })).toContain(
+      "contextMessages must be between 1 and 999",
+    );
+    expect(validateInstance({ ...ok(), contextMessages: 1000 })).toContain(
+      "contextMessages must be between 1 and 999",
+    );
+    expect(validateInstance({ ...ok(), contextMessages: 999 })).toEqual([]);
+  });
+
   it("defaults to full content mode so session cards show responses", () => {
     expect(defaultInstance().contentMode).toBe("full");
     expect(defaultInstance().dmOnly).toBe(true);

@@ -10,6 +10,7 @@ import {
 import type {
   ActionHandler,
   EphemeralInput,
+  HistoryMessage,
   HomeHandler,
   InboundContext,
   MentionHandler,
@@ -181,6 +182,37 @@ export class SocketModeTransport implements SlackTransport {
     return { ts: str(result.ts), channel: str(result.channel) };
   }
 
+  async history(
+    channel: string,
+    opts: { threadTs?: string; limit: number },
+  ): Promise<HistoryMessage[]> {
+    try {
+      const result = opts.threadTs
+        ? await this.#app.client.conversations.replies({
+            channel,
+            ts: opts.threadTs,
+            limit: opts.limit,
+          })
+        : await this.#app.client.conversations.history({ channel, limit: opts.limit });
+      return Array.isArray(result.messages)
+        ? result.messages.map((item: unknown) => {
+            const message = item && typeof item === "object" ? (item as AnyRecord) : {};
+            return {
+              text: str(message.text),
+              ts: str(message.ts),
+              ...(str(message.user) ? { user: str(message.user) } : {}),
+              ...(str(message.bot_id) ? { botId: str(message.bot_id) } : {}),
+              ...(str(message.subtype) ? { subtype: str(message.subtype) } : {}),
+            };
+          })
+        : [];
+    } catch (error) {
+      if ((error as { data?: { error?: string } })?.data?.error === "not_in_channel")
+        throw new Error("not_in_channel");
+      throw error;
+    }
+  }
+
   async updateMessage(input: UpdateInput): Promise<void> {
     await this.#app.client.chat.update({
       channel: input.channel,
@@ -275,6 +307,7 @@ export class SocketModeTransport implements SlackTransport {
       channel: input.channel,
       user: input.user,
       text: input.text,
+      ...(input.blocks ? { blocks: input.blocks as never } : {}),
       ...(input.threadTs ? { thread_ts: input.threadTs } : {}),
     });
   }

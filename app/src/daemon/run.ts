@@ -14,6 +14,7 @@ import { detectSecretStore } from "../config/secrets.js";
 import { HerdrClient, defaultSocketPath, sessionSocketPath } from "../herdr/client.js";
 import { EventTail } from "../herdr/events.js";
 import { SessionState } from "../herdr/state.js";
+import { loadBindings, saveBindings } from "../registry/bindings.js";
 import { SessionRegistry } from "../registry/registry.js";
 import { DryRunTransport, formatWrite } from "../slack/dry-run-transport.js";
 import { SocketModeTransport } from "../slack/socket-transport.js";
@@ -180,6 +181,10 @@ any problems below are what a real start would refuse on — this run continues 
     : role === "primary"
       ? new SocketModeTransport(config, (line) => log.event("surface", { msg: line }))
       : new WebApiTransport(config);
+
+  const saved = loadBindings(instance);
+  if (saved) config.channelBindings = saved;
+  else saveBindings(instance, config.channelBindings ?? {});
 
   const surfaces = new Surfaces({
     config,

@@ -32,7 +32,7 @@ describe("workspace-bound channel permissions", () => {
       ).toBe(true);
     }
   });
-  it("rejects unlisted users and channels", () => {
+  it("rejects unlisted users but lets an unbound channel request bind", () => {
     expect(
       checkInbound(
         { config, throttle: new ActionThrottle() },
@@ -44,11 +44,15 @@ describe("workspace-bound channel permissions", () => {
         { config, throttle: new ActionThrottle() },
         { teamId: "T1", userId: "U0C93G42G00", channel: "C999", surface: "mention" },
       ).reason,
-    ).toBe("channel_not_permitted");
+    ).toBeUndefined();
   });
-  it("rejects actions targeting the wrong workspace", () => {
+  it("rejects actions targeting the wrong workspace in bound C and G channels", () => {
     const deps = {
-      config,
+      config: {
+        ...config,
+        creOnly: false,
+        channelBindings: { ...config.channelBindings, G333: "w3" },
+      },
       throttle: new ActionThrottle(),
       resolveRef: () => "t1",
       isLive: () => true,
@@ -61,6 +65,10 @@ describe("workspace-bound channel permissions", () => {
       surface: "conversation" as const,
     };
     expect(authorizeAction(deps, ctx, "ref").decision.reason).toBe("workspace_mismatch");
+    expect(authorizeAction(deps, { ...ctx, channel: "C222" }, "ref").decision.allowed).toBe(true);
+    expect(authorizeAction(deps, { ...ctx, channel: "G333" }, "ref").decision.reason).toBe(
+      "workspace_mismatch",
+    );
   });
   it("rejects duplicate workspace bindings", () => {
     expect(validateInstance({ ...config, channelBindings: { C111: "w1", C222: "w1" } })).toContain(

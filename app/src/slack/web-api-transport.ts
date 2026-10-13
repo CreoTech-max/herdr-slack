@@ -11,6 +11,7 @@ import { SlackApiError, slackCall } from "./api.js";
 import type {
   ActionHandler,
   EphemeralInput,
+  HistoryMessage,
   HomeHandler,
   MentionHandler,
   MessageHandler,
@@ -61,6 +62,39 @@ export class WebApiTransport implements SlackTransport {
     return { ts: str(result.ts), channel: str(result.channel) };
   }
 
+  async history(
+    channel: string,
+    opts: { threadTs?: string; limit: number },
+  ): Promise<HistoryMessage[]> {
+    try {
+      const result = await this.#call(
+        opts.threadTs ? "conversations.replies" : "conversations.history",
+        {
+          channel,
+          limit: opts.limit,
+          ...(opts.threadTs ? { ts: opts.threadTs } : {}),
+        },
+      );
+      return Array.isArray(result.messages)
+        ? result.messages.map((item: unknown) => {
+            const message =
+              item && typeof item === "object" ? (item as Record<string, unknown>) : {};
+            return {
+              text: str(message.text),
+              ts: str(message.ts),
+              ...(str(message.user) ? { user: str(message.user) } : {}),
+              ...(str(message.bot_id) ? { botId: str(message.bot_id) } : {}),
+              ...(str(message.subtype) ? { subtype: str(message.subtype) } : {}),
+            };
+          })
+        : [];
+    } catch (error) {
+      if (error instanceof SlackApiError && error.slackError === "not_in_channel")
+        throw new Error("not_in_channel");
+      throw error;
+    }
+  }
+
   async updateMessage(input: UpdateInput): Promise<void> {
     await this.#call("chat.update", {
       channel: input.channel,
@@ -93,6 +127,7 @@ export class WebApiTransport implements SlackTransport {
       channel: input.channel,
       user: input.user,
       text: input.text,
+      ...(input.blocks ? { blocks: input.blocks } : {}),
       ...(input.threadTs ? { thread_ts: input.threadTs } : {}),
     });
   }

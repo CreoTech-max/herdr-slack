@@ -16,6 +16,7 @@ export interface SlackTransport {
   stop(): Promise<void>;
 
   postMessage(input: PostInput): Promise<{ ts: string; channel: string }>;
+  history(channel: string, opts: { threadTs?: string; limit: number }): Promise<HistoryMessage[]>;
   /**
    * A note only `user` can see, optionally inside a thread.
    *
@@ -54,6 +55,14 @@ export interface SlackTransport {
   onConnectionChange(handler: (connected: boolean) => void): void;
 }
 
+export interface HistoryMessage {
+  user?: string;
+  text: string;
+  ts: string;
+  botId?: string;
+  subtype?: string;
+}
+
 export interface PostInput {
   channel: string;
   text: string;
@@ -66,6 +75,7 @@ export interface EphemeralInput {
   user: string;
   text: string;
   threadTs?: string;
+  blocks?: unknown[];
 }
 
 export interface UpdateInput {
@@ -235,7 +245,7 @@ export function parseActionPayload(body: unknown, action: unknown): ParsedAction
   const viewId = str(asRecord(payload.view)?.id);
   return {
     actionId: str(actionRecord.action_id),
-    value: str(actionRecord.value),
+    value: str(actionRecord.value) || str(asRecord(actionRecord.selected_option)?.value),
     triggerId: str(payload.trigger_id),
     ...(viewId ? { viewId } : {}),
   };

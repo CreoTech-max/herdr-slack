@@ -1,7 +1,33 @@
 import { describe, expect, it } from "vitest";
 import { DeliveryLedger, parseActionPayload } from "../../src/slack/transport.js";
+import { FakeTransport } from "../helpers/fake-transport.js";
 
 describe("parseActionPayload", () => {
+  it("reads the selected option for a static_select but keeps button values", () => {
+    const body = { trigger_id: "trig-select", channel: { id: "C123" } };
+    expect(
+      parseActionPayload(body, {
+        action_id: "channel_bind_select",
+        selected_option: { text: { type: "plain_text", text: "Workspace" }, value: "herd:w1" },
+      }),
+    ).toEqual({ actionId: "channel_bind_select", value: "herd:w1", triggerId: "trig-select" });
+    expect(parseActionPayload(body, { action_id: "channel_new_agent", value: "C123" }).value).toBe(
+      "C123",
+    );
+  });
+
+  it("fake transport returns history or fails, and records ephemeral blocks", async () => {
+    const fake = new FakeTransport();
+    fake.historyMessages = [{ user: "U1", text: "hello", ts: "1" }];
+    expect(await fake.history("C123", { limit: 50 })).toEqual(fake.historyMessages);
+    fake.historyError = "not_in_channel";
+    await expect(fake.history("C123", { threadTs: "1", limit: 50 })).rejects.toThrow(
+      "not_in_channel",
+    );
+    const blocks = [{ type: "actions", elements: [] }];
+    await fake.postEphemeral({ channel: "C123", user: "U1", text: "Choose", blocks });
+    expect(fake.ephemerals[0]?.blocks).toEqual(blocks);
+  });
   it("parses a session-card button that carries no view", () => {
     // A message action (button on a session card) has no `view`. Reading
     // payload.view.id unconditionally used to throw here, so the button did
