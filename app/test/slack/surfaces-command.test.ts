@@ -143,6 +143,7 @@ describe("Surfaces commands and launching", () => {
       await transport.emitViewSubmit({
         ctx: ctx(),
         callbackId: MODAL_IDS.newAgent,
+        privateMetadata: '{"herdId":"default"}',
         view: submission({
           [BLOCK_IDS.directoryOther]: { [ACTION_IDS.directoryOther]: { value: "/work/app" } },
           [BLOCK_IDS.prompt]: { [ACTION_IDS.prompt]: { value: "start here" } },
@@ -170,6 +171,7 @@ describe("Surfaces commands and launching", () => {
       await transport.emitViewSubmit({
         ctx: ctx(),
         callbackId: MODAL_IDS.newAgent,
+        privateMetadata: '{"herdId":"default"}',
         view: submission({
           [BLOCK_IDS.kind]: { [ACTION_IDS.kind]: { selected_option: { value: "cre" } } },
         }),
@@ -187,6 +189,7 @@ describe("Surfaces commands and launching", () => {
       await transport.emitViewSubmit({
         ctx: ctx(),
         callbackId: MODAL_IDS.newAgent,
+        privateMetadata: '{"herdId":"default"}',
         view: submission({}),
       });
 
@@ -204,6 +207,7 @@ describe("Surfaces commands and launching", () => {
       await transport.emitViewSubmit({
         ctx: ctx(),
         callbackId: MODAL_IDS.newAgent,
+        privateMetadata: '{"herdId":"default"}',
         view: submission({}),
       });
 
@@ -219,6 +223,7 @@ describe("Surfaces commands and launching", () => {
       await transport.emitViewSubmit({
         ctx: ctx(),
         callbackId: MODAL_IDS.newAgent,
+        privateMetadata: '{"herdId":"default"}',
         view: submission({
           [BLOCK_IDS.directoryOther]: { [ACTION_IDS.directoryOther]: { value: "/work/app" } },
         }),
@@ -256,6 +261,7 @@ describe("Surfaces commands and launching", () => {
       await transport.emitViewSubmit({
         ctx: ctx(),
         callbackId: MODAL_IDS.newAgent,
+        privateMetadata: '{"herdId":"default"}',
         view: submission({
           [BLOCK_IDS.label]: { [ACTION_IDS.label]: { value: "Fix Auth Redirect!" } },
         }),

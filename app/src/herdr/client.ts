@@ -130,8 +130,11 @@ export class HerdrClient {
     return result.tabs ?? [];
   }
 
-  async worktreeList(): Promise<WorktreeInfo[]> {
-    const result = await this.request<{ worktrees?: WorktreeInfo[] }>("worktree.list");
+  async worktreeList(workspaceId?: string): Promise<WorktreeInfo[]> {
+    const result = await this.request<{ worktrees?: WorktreeInfo[] }>(
+      "worktree.list",
+      workspaceId ? { workspace_id: workspaceId } : {},
+    );
     return result.worktrees ?? [];
   }
 

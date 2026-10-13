@@ -45,7 +45,10 @@ export interface HerdAgentSnapshot {
   title: string;
   cwd: string;
   status: AgentStatus;
+  name: string;
+  workspaceId: string;
   workspaceLabel: string;
+  replyPosts?: { channel: string; ts: string }[];
   permalink?: string;
 }
 
@@ -53,6 +56,8 @@ export interface HerdAgentSnapshot {
 export interface HerdLaunchOptions {
   workspaces: { id: string; label: string }[];
   worktrees: { label: string; path: string; branch?: string }[];
+  /** Signed options per workspace; absent in old heartbeats, so omit their directory options. */
+  worktreesByWorkspace?: Record<string, HerdLaunchOptions["worktrees"]>;
   kinds: { kind: string; label: string }[];
 }
 
@@ -81,7 +86,14 @@ export interface SlackOwnership {
   updatedAt: number;
 }
 
-export type HerdCommandOp = "open_session" | "refresh" | "end_session" | "prompt" | "launch_agent";
+export type HerdCommandOp =
+  | "open_session"
+  | "refresh"
+  | "end_session"
+  | "prompt"
+  | "stop"
+  | "clear"
+  | "launch_agent";
 
 export interface HerdLaunchRequest {
   kind: string;
@@ -97,6 +109,9 @@ export interface HerdCommand {
   herdId: string;
   ref: string;
   channel: string;
+  threadTs?: string;
+  /** Workspace fixed by the primary's bound channel or DM at command time. */
+  expectedWorkspaceId?: string;
   userId: string;
   /** Prompt text, when relevant. */
   text?: string;

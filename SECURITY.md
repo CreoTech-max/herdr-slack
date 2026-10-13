@@ -36,8 +36,9 @@ Anyone able to act through the bot can run commands as you. Mitigations, all on 
   unless it is 0600. `doctor` tells you which of the two is in use.
 - **Nothing reads your clipboard.** Tokens are pasted at an explicit prompt, with terminal echo
   suppressed. Setup may *write* the app manifest to the clipboard; it never polls or reads it.
-- **Allowlist is Slack member IDs only.** Handles and display names are rejected — there is no
-  `users:read` roster lookup.
+- **Allowlist is Slack member IDs only.** Handles and display names are rejected. `users:read` is
+  used only to show usernames in `context` transcripts (one `users.info` per member ID, no roster
+  listing); a name never grants access.
 
 ### 2. What leaves your machine
 

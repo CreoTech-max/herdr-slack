@@ -239,7 +239,7 @@ describe("buildNewAgentModal", () => {
     const view = buildNewAgentModal(model({ selectedHerdId: "h2" }));
     const ids = (view.blocks as { block_id: string }[]).map((b) => b.block_id);
     expect(ids).not.toContain("b_herd");
-    expect(view.private_metadata).toBe("h2");
+    expect(view.private_metadata).toBe(JSON.stringify({ herdId: "h2" }));
   });
 
   /**
@@ -274,6 +274,31 @@ describe("buildNewAgentModal", () => {
     });
   });
 
+  it("locks the bound workspace, defaults to cre and keeps origin in metadata", () => {
+    const view = buildNewAgentModal(
+      model({
+        selectedHerdId: "h2",
+        lockedWorkspaceId: "w1",
+        origin: { channel: "C1", threadTs: "root" },
+      }),
+    );
+    const blocks = view.blocks as { block_id?: string }[];
+    expect(blocks.some((block) => block.block_id === BLOCK_IDS.workspace)).toBe(false);
+    expect(json(view)).toContain("posi");
+    expect(json(view)).toContain('"value":"cre"');
+    expect(view.private_metadata).toBe(
+      JSON.stringify({ herdId: "h2", workspaceId: "w1", channel: "C1", threadTs: "root" }),
+    );
+  });
+
+  it("uses a bound workspace id when the herd has not reported its label", () => {
+    const view = buildNewAgentModal(
+      model({ selectedHerdId: "h2", lockedWorkspaceId: "w9", workspaces: [] }),
+    );
+    expect(json(view)).toContain("Workspace: *w9*");
+    expect(json(view)).not.toContain(BLOCK_IDS.workspace);
+  });
+
   it("prefills the directory someone typed last time", () => {
     // The initial value was being dropped on the floor: `inputBlock` accepted
     // the option and never rendered it.
@@ -303,8 +328,38 @@ describe("parseNewAgentSubmission", () => {
     [BLOCK_IDS.kind]: { [ACTION_IDS.kind]: { selected_option: { value: "claude" } } },
   });
 
+  it("parses JSON herd and origin metadata, and ignores bare strings", () => {
+    expect(
+      parseNewAgentSubmission(
+        view(complete()),
+        JSON.stringify({ herdId: "h2", workspaceId: "w1", channel: "C1", threadTs: "root" }),
+      ),
+    ).toMatchObject({ herdId: "h2", workspaceId: "w1", channel: "C1", threadTs: "root" });
+    expect(parseNewAgentSubmission(view(complete()), "h2")).toBeNull();
+  });
+
+  it("ignores malformed, empty and array metadata", () => {
+    for (const metadata of ["", "{", "[]", "null", '"h2"']) {
+      expect(parseNewAgentSubmission(view(complete()), metadata)).toBeNull();
+    }
+  });
+
+  it("rejects JSON without a valid herd or with invalid origin fields", () => {
+    for (const metadata of [
+      "{}",
+      '{"herdId":42}',
+      '{"herdId":""}',
+      '{"herdId":"peer","channel":42}',
+      '{"herdId":"peer","workspaceId":false}',
+    ]) {
+      expect(parseNewAgentSubmission(view(complete()), metadata)).toBeNull();
+    }
+  });
+
   it("reads the required fields", () => {
-    expect(parseNewAgentSubmission(view(complete()))).toMatchObject({ kind: "claude" });
+    expect(parseNewAgentSubmission(view(complete()), '{"herdId":"local"}')).toMatchObject({
+      kind: "claude",
+    });
   });
 
   it("refuses a submission missing the agent", () => {
@@ -321,6 +376,7 @@ describe("parseNewAgentSubmission", () => {
         },
         [BLOCK_IDS.directoryOther]: { [ACTION_IDS.directoryOther]: { value: "  /typed  " } },
       }),
+      '{"herdId":"local"}',
     );
     expect(result?.cwd).toBe("/typed");
   });
@@ -334,6 +390,7 @@ describe("parseNewAgentSubmission", () => {
         },
         [BLOCK_IDS.directoryOther]: { [ACTION_IDS.directoryOther]: { value: "   " } },
       }),
+      '{"herdId":"local"}',
     );
     expect(result?.cwd).toBe("/picked");
   });
@@ -345,6 +402,7 @@ describe("parseNewAgentSubmission", () => {
         [BLOCK_IDS.label]: { [ACTION_IDS.label]: { value: "  " } },
         [BLOCK_IDS.prompt]: { [ACTION_IDS.prompt]: { value: "" } },
       }),
+      '{"herdId":"local"}',
     );
     expect(result).not.toHaveProperty("label");
     expect(result).not.toHaveProperty("firstPrompt");
@@ -353,6 +411,7 @@ describe("parseNewAgentSubmission", () => {
   it("trims a first prompt", () => {
     const result = parseNewAgentSubmission(
       view({ ...complete(), [BLOCK_IDS.prompt]: { [ACTION_IDS.prompt]: { value: "  go  " } } }),
+      '{"herdId":"local"}',
     );
     expect(result?.firstPrompt).toBe("go");
   });

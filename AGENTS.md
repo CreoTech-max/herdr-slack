@@ -34,9 +34,14 @@ Security-sensitive; breaking these is a security bug.
    action time; fail closed when the terminal is gone.
 2. **Block Kit payloads carry only an opaque `ref`.** Never a pane id or terminal id.
 3. **Fail closed** on unknown ref, dead terminal, wrong `team_id`, non-allowlisted user, exhausted
-   throttle, or **herdr not connected** (Reply / End / Refresh / Earlier / New agent / menu choices).
-4. **Every outbound terminal payload is redacted** (`redact.ts`) before Slack sees it. Extracted
-   replies are rendered as mrkdwn sections (`response.ts` → `responseSections`), never raw scrollback.
+   throttle, or **target herdr not connected** (Reply / End / Refresh / Earlier / New agent /
+   menu choices / bind / unbind / agents / named-agent verbs where herdr access is needed).
+4. **Every outbound reply is redacted** (`redact.ts`) before registry storage or Slack. Pi/cre
+   replies use the locally reported, validated session JSONL and a persisted pre-send turn boundary;
+   verified directory and file identity persist with that boundary. Missing or changed sessions fail
+   closed, never fall back to terminal scrollback. Same-OS-account processes are trusted; portable
+   path checks do not provide atomic containment against a hostile same-account writer. Non-Pi agents
+   retain the existing terminal extractor. Replies use mrkdwn sections (`responseSections`).
 5. **No inbound listener.** Phone control requires the **machine awake** with herdr running — sleep
    freezes the daemon and Socket Mode; there is no wake-from-Slack path.
 6. **Daemon reads `herdrSocketPath` from config**, not `HERDR_SOCKET_PATH` at runtime (except
@@ -45,7 +50,9 @@ Security-sensitive; breaking these is a security bug.
 8. **Credentials in OS keychain when available**; read via `withCredentials`.
 9. **Never read the user's clipboard** (polling). Writing the setup manifest to the clipboard is
    allowed.
-10. **Allowlist is Slack member IDs only** — no handle/display-name resolution, no `users:read`.
+10. **Allowlist is Slack member IDs only** — no handle/display-name resolution for authorization.
+    `users:read` exists only so `context` can show `users.info` usernames as display text, looked
+    up per member ID after filtering; a missing or unsafe name falls back to the ID.
 11. **Every herd-registry record is signed, and unverifiable records are dropped.** A shared registry
     directory is writable by other local accounts, and a queued command is *typed into a terminal* —
     so "can create a file there" must not mean "can drive your agents". The HMAC key derives from the
@@ -54,12 +61,24 @@ Security-sensitive; breaking these is a security bug.
 
 ## Interaction model
 
-- One updating **session card** per agent (not a chat/terminal mirror).
-- Prompts enter only through the **Reply** modal; ordinary thread messages never reach an agent.
-- **End session** = herdr `pane.close` (confirm-gated); not Esc / Ctrl-C.
-- **Earlier** excludes the response already on the card; one prior turn per modal page.
-- A settled turn posts **one** threaded reply notice (claimed by turn id) so Slack notifies the user;
-  `chat.update` alone is silent.
+- A channel (`C`/`G`) or bot DM (`D`) binds to one herd workspace. Bound DM prompts reply in that DM.
+  `CHANNEL_WORKSPACES.md` describes the older `creOnly` attach mode; channel card sync runs only there.
+- `@herdr bind`, `unbind`, `agents`, `new`, `help`, and `<name> <prompt>` are the channel commands.
+  `<name> context <prompt>`, `<name> stop`, and `<name> clear` are agent verbs. Command words are
+  reserved agent names. A bound DM also accepts bare commands. Stop sends Esc; clear sends `/new`
+  and restores the herdr agent name.
+- Tagged `app_mention` and `message.*` deliveries share a `ts` and enter one deduplicated handler.
+  Check team, allowlist and throttle once per mention before resolving a live named agent inside
+  the bound workspace. Fail closed if the target herd is offline. `context` includes only recent
+  messages from allowlisted humans and redacts them before a prompt reaches an agent.
+- A mention has no `trigger_id`: `new` sends an ephemeral button that opens the locked-workspace
+  modal on click. A settled turn posts one reply at its latest prompt origin in a channel, DM, or
+  thread. A reply in that posted reply's thread prompts the same agent. A prompt to a busy agent
+  steers the existing turn to its latest origin; it does not start a second turn.
+- App Home and manual session cards remain supported. One card per agent updates in place; the
+  **Reply** modal also sends prompts. **End session** = herdr `pane.close` (confirm-gated), not Esc.
+  **Earlier** excludes the response already on the card; one prior turn per modal page. Settled
+  card turns post one threaded reply notice (claimed by turn id); `chat.update` alone is silent.
 - Shared Slack write budget is a **single** token bucket (`RateBudget`), not separate control/data
   lanes.
 - When herdr is down, cards and Home **omit** interactive controls and refuse those actions — keep
@@ -109,6 +128,10 @@ Security-sensitive; breaking these is a security bug.
   thread titles. Agent *names* need no such care — herdr refuses a name in use and `launchAgent`
   walks to the next one. If herdr will not answer `tab.list`, launch with the label as asked: a
   duplicate is a much smaller problem than a refused launch.
+- One New-agent modal view launches once per process: team, user and Slack view id identify its
+  submissions. Ack each redelivery; validation errors let the same view submit again. Bound forms
+  list only the selected workspace's worktrees, including signed peer options. Socket recycling
+  waits for view acknowledgments and actual disconnect before it starts a replacement connection.
 
 ### Slack Block Kit facts that are not obvious
 

@@ -40,8 +40,16 @@ describe("manifest", () => {
     expect(scopes).toEqual([...BASE_SCOPES]);
     expect(scopes).toContain("channels:history");
     expect(scopes).toContain("groups:history");
-    expect(scopes).not.toContain("users:read");
     expect(scopes).not.toContain("commands");
+  });
+
+  it("asks for users:read only to show context usernames, never emails", () => {
+    const scopes = scopesFor({ appName: "Herdr" });
+    expect(scopes).toContain("users:read");
+    expect(scopes).not.toContain("users:read.email");
+    expect(adminRequest({ appName: "Herdr" })).toContain(
+      "users:read: show usernames instead of member IDs in context; not used for access",
+    );
   });
 
   it("always includes the scopes each surface actually needs", () => {

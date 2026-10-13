@@ -234,7 +234,7 @@ describe("Surfaces", () => {
       const view = transport.modalUpdates.at(-1)?.view ?? {};
       const ids = ((view.blocks ?? []) as { block_id: string }[]).map((b) => b.block_id);
       expect(ids).not.toContain("b_herd");
-      expect(view.private_metadata).toBe("host:them:default");
+      expect(view.private_metadata).toBe(JSON.stringify({ herdId: "host:them:default" }));
     });
 
     it("refuses from the overview, where no herd is implied", async () => {
@@ -292,7 +292,7 @@ describe("Surfaces", () => {
       await transport.emitViewSubmit({
         ctx: ctx(),
         callbackId: "modal_new_agent",
-        privateMetadata: "host:them:default",
+        privateMetadata: JSON.stringify({ herdId: "host:them:default" }),
         view: {
           values: {
             b_kind: { a_kind: { selected_option: { value: "claude" } } },
@@ -313,7 +313,7 @@ describe("Surfaces", () => {
       await transport.emitViewSubmit({
         ctx: ctx(),
         callbackId: "modal_new_agent",
-        privateMetadata: "host:me:default",
+        privateMetadata: JSON.stringify({ herdId: "host:me:default" }),
         view: { values: { b_kind: { a_kind: { selected_option: { value: "claude" } } } } },
       });
       expect(herd.forwarded).toEqual([]);

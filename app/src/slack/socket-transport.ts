@@ -1,6 +1,7 @@
 import bolt from "@slack/bolt";
 import type { InstanceConfig } from "../config/config.js";
 import { contextFromPayload } from "./inbound.js";
+import { BLOCK_IDS, MODAL_IDS } from "./modals.js";
 import {
   DeliveryLedger,
   VIEW_SUBMIT_BUDGET_MS,
@@ -34,14 +35,9 @@ import type {
 const IDLE_TEARDOWN_MS = 90_000;
 
 /**
- * Bound on one recycle attempt (stop + start).
- *
- * Without this, a hung `app.start()` — seen live as a promise that never
- * settled, alongside "recycle failed: undefined" from something rejecting
- * with no reason at all — leaves `#recycling` stuck `true` forever, since its
- * `finally` never runs. Every later watchdog tick then no-ops on the guard,
- * silently disabling recovery for good. A timeout forces the attempt to fail
- * fast so the next tick gets a real try.
+ * Warn on a stalled recycle. Do not start another socket while an earlier
+ * disconnect/start is still pending. Once it settles, a later watchdog tick
+ * can retry; overlapping lifecycles would put acks on the wrong socket.
  */
 const RECYCLE_TIMEOUT_MS = 20_000;
 
@@ -61,6 +57,15 @@ export class SocketModeTransport implements SlackTransport {
   #watchdog: NodeJS.Timeout | null = null;
   /** Guards against the idle check and the readyState check both firing a recycle at once. */
   #recycling = false;
+  #recycleTask: Promise<void> | null = null;
+  #stopping = false;
+  #socketRunning = false;
+  #pendingAcks = new Set<Promise<void>>();
+  /** ponytail: keep 500 settled views in memory; persist IDs only if restart retries prove necessary. */
+  #viewSubmissions = new Map<
+    string,
+    { result: Promise<Awaited<ReturnType<ViewSubmitHandler>>>; pending: boolean }
+  >();
   #connectionHandlers: ((connected: boolean) => void)[] = [];
   /** trigger_ids already handled, to drop Slack's redeliveries. */
   #deliveries = new DeliveryLedger();
@@ -135,7 +140,10 @@ export class SocketModeTransport implements SlackTransport {
   }
 
   async start(): Promise<void> {
+    if (this.#recycleTask) await this.#recycleTask;
+    this.#stopping = false;
     await this.#app.start();
+    this.#socketRunning = true;
     this.#setConnected(true);
     this.#watchdog = setInterval(() => this.#checkHealth(), 15_000);
     this.#watchdog.unref?.();
@@ -150,7 +158,7 @@ export class SocketModeTransport implements SlackTransport {
    * catches a socket the client itself has lost track of.
    */
   #checkHealth(): void {
-    if (this.#recycling) return;
+    if (this.#recycling || this.#stopping) return;
     const active = this.#receiver.client.websocket?.isActive() ?? false;
     if (this.#connected && !active) {
       this.#log("slack: websocket reports inactive while still marked connected, recycling socket");
@@ -164,10 +172,30 @@ export class SocketModeTransport implements SlackTransport {
   }
 
   async stop(): Promise<void> {
+    this.#stopping = true;
     if (this.#watchdog) clearInterval(this.#watchdog);
     this.#watchdog = null;
     this.#setConnected(false);
-    await this.#app.stop().catch(() => undefined);
+    if (this.#recycleTask) await this.#recycleTask;
+    await Promise.all([...this.#pendingAcks]);
+    if (this.#socketRunning) await this.#disconnect().catch(() => undefined);
+  }
+
+  /** Bolt's receiver.stop resolves before its SocketModeClient disconnects. */
+  async #disconnect(): Promise<void> {
+    const client = this.#receiver.client;
+    let finished: () => void = () => undefined;
+    const disconnected = new Promise<void>((resolve) => {
+      finished = resolve;
+      client.once("disconnected", finished);
+    });
+    try {
+      await this.#app.stop();
+      await disconnected;
+      this.#socketRunning = false;
+    } finally {
+      client.off("disconnected", finished);
+    }
   }
 
   async postMessage(input: PostInput): Promise<{ ts: string; channel: string }> {
@@ -187,13 +215,7 @@ export class SocketModeTransport implements SlackTransport {
     opts: { threadTs?: string; limit: number },
   ): Promise<HistoryMessage[]> {
     try {
-      const result = opts.threadTs
-        ? await this.#app.client.conversations.replies({
-            channel,
-            ts: opts.threadTs,
-            limit: opts.limit,
-          })
-        : await this.#app.client.conversations.history({ channel, limit: opts.limit });
+      const result = await this.#app.client.conversations.history({ channel, limit: opts.limit });
       return Array.isArray(result.messages)
         ? result.messages.map((item: unknown) => {
             const message = item && typeof item === "object" ? (item as AnyRecord) : {};
@@ -211,6 +233,13 @@ export class SocketModeTransport implements SlackTransport {
         throw new Error("not_in_channel");
       throw error;
     }
+  }
+
+  async userName(userId: string): Promise<string | undefined> {
+    const result = await this.#app.client.users.info({ user: userId });
+    const user: unknown = result.user;
+    if (!user || typeof user !== "object" || (user as AnyRecord).deleted === true) return undefined;
+    return str((user as AnyRecord).name) || undefined;
   }
 
   async updateMessage(input: UpdateInput): Promise<void> {
@@ -273,13 +302,61 @@ export class SocketModeTransport implements SlackTransport {
       this.#touch();
       const payload = toRecord(body);
       const viewRecord = toRecord(view);
-      const running = handler({
-        ctx: this.#context(payload),
-        callbackId: str(viewRecord.callback_id),
-        view: viewRecord.state,
-        privateMetadata: str(viewRecord.private_metadata),
+      const ctx = this.#context(payload);
+      const callbackId = str(viewRecord.callback_id);
+      const viewId = str(viewRecord.id);
+      const team =
+        str(
+          payload.team && typeof payload.team === "object" ? toRecord(payload.team).id : undefined,
+        ) || str(payload.team_id);
+      const key =
+        callbackId === MODAL_IDS.newAgent ? `${team}\u0000${ctx.userId}\u0000${viewId}` : "";
+      if (callbackId === MODAL_IDS.newAgent && (!team || !ctx.userId || !viewId)) {
+        await ack({
+          response_action: "errors",
+          errors: { [BLOCK_IDS.kind]: "Reopen this form." },
+        } as never);
+        return;
+      }
+      let entry = key ? this.#viewSubmissions.get(key) : undefined;
+      if (!entry) {
+        const result = Promise.resolve().then(() =>
+          handler({
+            ctx,
+            callbackId,
+            view: viewRecord.state,
+            privateMetadata: str(viewRecord.private_metadata),
+          }),
+        );
+        entry = { result, pending: true };
+        if (key) {
+          this.#viewSubmissions.set(key, entry);
+          const saved = entry;
+          const settled = () => {
+            saved.pending = false;
+            if (this.#viewSubmissions.size <= 500) return;
+            for (const [id, item] of this.#viewSubmissions) {
+              if (!item.pending) {
+                this.#viewSubmissions.delete(id);
+                break;
+              }
+            }
+          };
+          void result.then((outcome) => {
+            if (outcome && Object.keys(outcome.errors).length) this.#viewSubmissions.delete(key);
+            settled();
+          }, settled);
+        }
+        void result.catch((error: unknown) => {
+          this.#log(`view submit failed: ${(error as Error).message}`);
+        });
+      }
+      const running = entry.result;
+      let finishAck: () => void = () => undefined;
+      const pendingAck = new Promise<void>((resolve) => {
+        finishAck = resolve;
       });
-
+      this.#pendingAcks.add(pendingAck);
       let timer: NodeJS.Timeout | undefined;
       const budget = new Promise<"timeout">((resolve) => {
         timer = setTimeout(() => resolve("timeout"), VIEW_SUBMIT_BUDGET_MS);
@@ -295,9 +372,8 @@ export class SocketModeTransport implements SlackTransport {
         await ack();
       } finally {
         if (timer) clearTimeout(timer);
-        void running.catch((error: unknown) => {
-          this.#log(`view submit failed: ${(error as Error).message}`);
-        });
+        this.#pendingAcks.delete(pendingAck);
+        finishAck();
       }
     });
   }
@@ -414,7 +490,7 @@ export class SocketModeTransport implements SlackTransport {
 
   #touch(): void {
     this.#lastFrameAt = Date.now();
-    if (!this.#connected) this.#setConnected(true);
+    if (!this.#connected && !this.#stopping && !this.#recycling) this.#setConnected(true);
   }
 
   #setConnected(connected: boolean): void {
@@ -426,32 +502,37 @@ export class SocketModeTransport implements SlackTransport {
 
   /* v8 ignore start -- needs a live socket to exercise */
   async #recycle(): Promise<void> {
-    if (this.#recycling) return;
+    if (this.#recycling || this.#stopping) return;
     this.#recycling = true;
     this.#setConnected(false);
     let timer: NodeJS.Timeout | undefined;
+    let timedOut = false;
+    this.#recycleTask = (async () => {
+      try {
+        // Ack the original envelope before the SDK can route it to a replacement socket.
+        await Promise.all([...this.#pendingAcks]);
+        if (this.#stopping) return;
+        await this.#disconnect();
+        if (this.#stopping || timedOut) return;
+        await this.#app.start();
+        this.#socketRunning = true;
+        if (!this.#stopping) this.#setConnected(true);
+      } catch (error) {
+        this.#log(
+          `slack: recycle failed, still disconnected: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    })();
+    timer = setTimeout(() => {
+      timedOut = true;
+      this.#log("slack: recycle timed out; waiting for socket lifecycle before retry");
+    }, RECYCLE_TIMEOUT_MS);
+    timer.unref?.();
     try {
-      const timeout = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("recycle timed out")), RECYCLE_TIMEOUT_MS);
-        timer.unref?.();
-      });
-      await Promise.race([
-        (async () => {
-          await this.#app.stop();
-          await this.#app.start();
-        })(),
-        timeout,
-      ]);
-      this.#setConnected(true);
-    } catch (error) {
-      // Bolt retries on its own; the next watchdog tick tries again. Logged
-      // rather than swallowed — a silent failure here looks identical to a
-      // healthy reconnect until buttons stop working.
-      this.#log(
-        `slack: recycle failed, still disconnected: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      await this.#recycleTask;
     } finally {
       if (timer) clearTimeout(timer);
+      this.#recycleTask = null;
       this.#recycling = false;
     }
   }

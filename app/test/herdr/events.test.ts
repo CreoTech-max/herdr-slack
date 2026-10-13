@@ -90,6 +90,46 @@ describe("EventTail", () => {
     expect(seen[0]).toMatchObject({ terminalId: "term_new", from: undefined, to: "working" });
   });
 
+  it("projects a Pi session path event and repairs it from a reconnect snapshot", async () => {
+    const old = pane({
+      terminal_id: "term_pi",
+      agent: "pi",
+      agent_session: { agent: "pi", kind: "path", source: "herdr:pi", value: "/local/old.jsonl" },
+    });
+    let current = old;
+    fake.on("session.snapshot", () => ({ snapshot: snapshot({ panes: [current] }) }));
+    tail.start();
+    await waitFor(() => fake.subscriberCount >= 1);
+    fake.emitSubscriptionStarted();
+    await waitFor(() => state.primed);
+    fake.emitEvent({
+      type: "pane_updated",
+      pane: {
+        ...old,
+        agent_session: { agent: "pi", kind: "path", source: "herdr:pi", value: "/local/new.jsonl" },
+      },
+    });
+    await waitFor(
+      () => state.paneByTerminal("term_pi")?.agent_session?.value === "/local/new.jsonl",
+    );
+    current = {
+      ...old,
+      agent_session: {
+        agent: "pi",
+        kind: "path",
+        source: "herdr:pi",
+        value: "/local/reconnected.jsonl",
+      },
+    };
+    fake.dropConnections();
+    await waitFor(() => tail.status === "waiting");
+    await waitFor(() => tail.status === "connected", 5_000);
+    fake.emitSubscriptionStarted();
+    await waitFor(
+      () => state.paneByTerminal("term_pi")?.agent_session?.value === "/local/reconnected.jsonl",
+    );
+  });
+
   it("survives a malformed frame and keeps processing", async () => {
     fake.on("session.snapshot", () => ({ snapshot: snapshot() }));
     tail.start();

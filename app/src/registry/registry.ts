@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import type { PiBoundary } from "../agents/pi-session.js";
 import { stateDir } from "../config/instance.js";
 import type { AgentStatus } from "../herdr/types.js";
 
@@ -25,6 +26,12 @@ export interface SessionTurn {
   notifiedAt?: number;
   /** Where the prompt came from; the settled reply is posted there. */
   origin?: { channel: string; threadTs?: string };
+  /** Stable Pi path, session, and pre-send leaf; survives daemon restart and steering. */
+  piBoundary?: PiBoundary;
+  /** Workspace selected for a channel turn, even if the live pane later moves. */
+  expectedWorkspaceId?: string;
+  /** Await herdr prompt delivery before this turn can settle. */
+  deliveryPending?: boolean;
 }
 
 export interface SessionRecord {
@@ -66,6 +73,10 @@ export interface SessionRecord {
    * would read as the same conversation growing longer every time.
    */
   responseBaseline?: string;
+  /** Last structured assistant entry accounted for, across turns and daemon restarts. */
+  lastPiResponseId?: string;
+  /** /new was sent; do not reuse this old Pi source until herdr reports its replacement. */
+  piClearedPath?: string;
   /** A user-ended remote session must not be revived just because the pane still exists. */
   closedByUser?: boolean;
   /** Thread roots of posted replies, so a thread reply finds its agent. Newest last. */
@@ -173,6 +184,8 @@ export class SessionRegistry {
     baseline: string,
     origin?: SessionTurn["origin"],
     now = Date.now(),
+    piBoundary?: PiBoundary,
+    expectedWorkspaceId?: string,
   ): SessionTurn | undefined {
     const record = this.#byTerminal.get(terminalId);
     if (!record || record.ended) return undefined;
@@ -183,9 +196,16 @@ export class SessionRegistry {
       createdAt: now,
       ...(baseline ? { baseline } : {}),
       ...(origin ? { origin } : {}),
+      ...(piBoundary ? { piBoundary } : {}),
+      ...(origin ? { expectedWorkspaceId: expectedWorkspaceId ?? record.workspaceId } : {}),
     };
     record.turns = [...(record.turns ?? []), turn].slice(-20);
     return turn;
+  }
+
+  discardTurn(terminalId: string, turnId: string): void {
+    const record = this.#byTerminal.get(terminalId);
+    if (record?.turns) record.turns = record.turns.filter((turn) => turn.id !== turnId);
   }
 
   activeTurn(terminalId: string): SessionTurn | undefined {
@@ -195,13 +215,31 @@ export class SessionRegistry {
   updateTurn(
     terminalId: string,
     turnId: string,
-    fields: Partial<Pick<SessionTurn, "response" | "status" | "completedAt" | "origin">>,
+    fields: Partial<
+      Pick<
+        SessionTurn,
+        | "response"
+        | "status"
+        | "completedAt"
+        | "origin"
+        | "piBoundary"
+        | "deliveryPending"
+        | "expectedWorkspaceId"
+      >
+    >,
   ): void {
     const turns = this.#byTerminal.get(terminalId)?.turns;
     const index = turns?.findIndex((item) => item.id === turnId) ?? -1;
     const turn = turns?.[index];
     if (!turn || !turns) return;
-    const updated = { ...turn, ...fields };
+    const workspaceId = this.#byTerminal.get(terminalId)?.workspaceId;
+    const updated = {
+      ...turn,
+      ...fields,
+      ...(fields.origin && !fields.expectedWorkspaceId && !turn.expectedWorkspaceId && workspaceId
+        ? { expectedWorkspaceId: workspaceId }
+        : {}),
+    };
     turns[index] =
       fields.status && fields.status !== "working"
         ? {
@@ -215,6 +253,13 @@ export class SessionRegistry {
             ...(updated.notifiedAt === undefined ? {} : { notifiedAt: updated.notifiedAt }),
             // Dropping this would post the reply to the card instead of where it was asked.
             ...(updated.origin === undefined ? {} : { origin: updated.origin }),
+            ...(updated.piBoundary === undefined ? {} : { piBoundary: updated.piBoundary }),
+            ...(updated.deliveryPending === undefined
+              ? {}
+              : { deliveryPending: updated.deliveryPending }),
+            ...(updated.expectedWorkspaceId === undefined
+              ? {}
+              : { expectedWorkspaceId: updated.expectedWorkspaceId }),
           }
         : updated;
   }

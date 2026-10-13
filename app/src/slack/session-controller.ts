@@ -1,3 +1,4 @@
+import { type PiBoundary, readPiSession } from "../agents/pi-session.js";
 import type { InstanceConfig } from "../config/config.js";
 import type { HerdrClient } from "../herdr/client.js";
 import type { SessionState } from "../herdr/state.js";
@@ -43,6 +44,7 @@ export interface SessionControllerDeps {
 export interface ActionOutcome {
   ok: boolean;
   message?: string;
+  piBoundary?: PiBoundary;
 }
 
 /** Authorised Slack actions → herdr calls; resolve pane id at call time. */
@@ -50,6 +52,8 @@ export const SESSION_OVER =
   "This agent has exited — the thread is closed. Start a new one with `+ New agent`.";
 
 const RESPONSE_LINES = 120;
+const INTERRUPT_KEYS = ["esc"];
+const CLEAR_PROMPT = "/new";
 
 /** The one-line header on a pushed reply; also the notification preview text. */
 function replyNotice(agent: string, title: string, status: TurnStatus): string {
@@ -71,6 +75,9 @@ const TURN_GLYPH: Record<TurnStatus, string> = {
 };
 
 export class SessionController {
+  #settledDuringDelivery = new Map<string, "done" | "blocked" | "stopped" | "failed">();
+  #inflightTurn = new Map<string, string>();
+
   constructor(private readonly deps: SessionControllerDeps) {}
 
   /** Open or reuse the single updating remote-control card. */
@@ -245,6 +252,7 @@ export class SessionController {
     const pane = this.deps.state.paneByTerminal(terminalId);
     if (
       !pane ||
+      pane.agent === "pi" ||
       !sendsTerminalText(this.deps.config.contentMode) ||
       isExcluded(pane.cwd ?? "", this.deps.config.excludePaths)
     ) {
@@ -265,7 +273,14 @@ export class SessionController {
     const { state, registry, client, log } = this.deps;
     const pane = state.paneByTerminal(terminalId);
     const record = registry.get(terminalId);
-    if (!pane || !record || !this.hasReplyTarget(terminalId)) return;
+    if (
+      !pane ||
+      !record ||
+      record.ended ||
+      !this.hasReplyTarget(terminalId) ||
+      this.deps.isHerdrConnected?.() === false
+    )
+      return;
     if (
       !sendsTerminalText(this.deps.config.contentMode) ||
       isExcluded(pane.cwd ?? "", this.deps.config.excludePaths)
@@ -274,20 +289,118 @@ export class SessionController {
       return;
     }
 
-    const raw = await client
-      .read(pane.pane_id, "recent_unwrapped", RESPONSE_LINES)
-      .catch((error) => {
-        log(`response read failed for ${terminalId}: ${(error as Error).message}`);
-        return "";
-      });
     const active = registry.activeTurn(terminalId);
-    const { text: safe, hits } = redact(raw);
-    const response = extractAgentResponse(
-      safe,
-      active?.baseline ?? record.responseBaseline,
-      pane.agent ?? undefined,
-    );
-    if (hits.length > 0) log(`redacted ${hits.join(",")} from ${terminalId} response`);
+    if (active?.deliveryPending) {
+      if (complete && this.#inflightTurn.get(terminalId) === active.id)
+        this.#settledDuringDelivery.set(terminalId, complete);
+      return;
+    }
+    let finalStatus = complete;
+    let response = "";
+    let safe = "";
+    if (pane.agent === "pi") {
+      const session = pane.agent_session;
+      const source =
+        session?.agent === "pi" && session.kind === "path" && session.source === "herdr:pi"
+          ? session.value
+          : undefined;
+      const result = active
+        ? await readPiSession(source, active.piBoundary)
+        : { kind: "unavailable" as const, reason: "No verified active Pi turn." };
+      const current = state.paneByTerminal(terminalId);
+      if (
+        !current ||
+        record.ended ||
+        registry.get(terminalId) !== record ||
+        this.deps.isHerdrConnected?.() === false ||
+        (active?.origin && active.expectedWorkspaceId !== pane.workspace_id) ||
+        current.pane_id !== pane.pane_id ||
+        current.workspace_id !== pane.workspace_id ||
+        current.agent !== "pi" ||
+        current.agent_status === "working" ||
+        current.agent_session?.value !== session?.value ||
+        current.agent_session?.kind !== session?.kind ||
+        current.agent_session?.source !== session?.source ||
+        registry.activeTurn(terminalId)?.id !== active?.id ||
+        registry.activeTurn(terminalId)?.deliveryPending ||
+        registry.activeTurn(terminalId)?.piBoundary !== active?.piBoundary ||
+        (complete && (state.statusOf(terminalId) ?? current.agent_status) === "working")
+      )
+        return;
+      if (!active) {
+        if (complete && record.lastPiResponseId) return; // Repeat settle; keep the posted reply.
+        registry.setLatestResponse(terminalId, "Pi reply unavailable: No verified active Pi turn.");
+        registry.save();
+        await this.updateCard(terminalId);
+        return;
+      }
+      if (result.kind === "pending" && !active.piBoundary?.fileIdentity) {
+        registry.updateTurn(terminalId, active.id, { piBoundary: result.boundary });
+        registry.save();
+      }
+      if (complete === "blocked" && (result.kind === "unavailable" || result.kind === "pending"))
+        return;
+      const idleSnapshot = !complete && pane.agent_status === "idle";
+      if (result.kind === "pending") {
+        if (!complete) return;
+        response = "Pi reply unavailable: No complete Pi reply for this turn.";
+        finalStatus = "failed";
+      } else if (
+        !active.piBoundary ||
+        record.piClearedPath === source ||
+        result.kind === "unavailable" ||
+        result.kind === "boundary"
+      ) {
+        if (!complete && !idleSnapshot) {
+          registry.setLatestResponse(
+            terminalId,
+            `Pi reply unavailable: ${result.kind === "unavailable" ? result.reason : "No verified turn boundary."}`,
+          );
+          registry.save();
+          await this.updateCard(terminalId);
+          return;
+        }
+        response = `Pi reply unavailable: ${result.kind === "unavailable" ? result.reason : "No verified turn boundary."}`;
+        finalStatus = "failed";
+      } else if (result.kind === "failed") {
+        if (!complete && !idleSnapshot) return;
+        response =
+          result.reason === "stopped"
+            ? "Pi turn stopped without a complete reply."
+            : "Pi turn failed without a complete reply.";
+        finalStatus = result.reason;
+      } else {
+        if (result.boundary !== active.piBoundary)
+          registry.updateTurn(terminalId, active.id, { piBoundary: result.boundary });
+        if (record.lastPiResponseId === result.identity) {
+          if ((!complete && !idleSnapshot) || !active) return;
+          response = "Pi reply unavailable: no new answer for this turn.";
+          finalStatus = "failed";
+        } else {
+          if (!complete && this.#settledAs(terminalId, pane) !== "done") return;
+          finalStatus = complete ?? "done";
+          const redaction = redact(result.text);
+          response = redaction.text;
+          if (redaction.hits.length > 0)
+            log(`redacted ${redaction.hits.join(",")} from ${terminalId} response`);
+          record.lastPiResponseId = result.identity;
+        }
+      }
+    } else {
+      const raw = await client
+        .read(pane.pane_id, "recent_unwrapped", RESPONSE_LINES)
+        .catch((error) => {
+          log(`response read failed for ${terminalId}: ${(error as Error).message}`);
+          return "";
+        });
+      const redaction = redact(raw);
+      safe = redaction.text;
+      response = extractAgentResponse(safe, active?.baseline ?? record.responseBaseline);
+      if (redaction.hits.length > 0)
+        log(`redacted ${redaction.hits.join(",")} from ${terminalId} response`);
+    }
+    if (active && (active.deliveryPending || registry.activeTurn(terminalId)?.id !== active.id))
+      return;
     let settled: string | undefined;
     if (response) {
       registry.setLatestResponse(terminalId, response);
@@ -299,24 +412,38 @@ export class SessionController {
         settled = this.#recordSelfStartedTurn(
           terminalId,
           response,
-          complete ?? this.#settledAs(terminalId, pane),
+          finalStatus ?? this.#settledAs(terminalId, pane),
         );
         // Everything on screen is now filed under a turn, so the next one
         // reports only what the agent said after this point.
         if (settled) registry.setResponseBaseline(terminalId, safe);
       }
     }
-    if (active && complete) {
+    if (active && finalStatus) {
       registry.updateTurn(terminalId, active.id, {
-        status: complete,
+        status: finalStatus,
         completedAt: Date.now(),
       });
       registry.setResponseBaseline(terminalId, safe);
       settled = active.id;
     }
     registry.save();
+    const replyCheck = {
+      ref: record.ref,
+      paneId: pane.pane_id,
+      workspaceId: pane.workspace_id,
+      sessionPath: pane.agent_session?.value,
+      boundary: registry.turns(terminalId).find((item) => item.id === settled)?.piBoundary,
+      identity: record.lastPiResponseId,
+      origin: registry.turns(terminalId).find((item) => item.id === settled)?.origin,
+      allowUnavailablePiNotice:
+        pane.agent === "pi" &&
+        !complete &&
+        pane.agent_status === "idle" &&
+        finalStatus === "failed",
+    };
     await this.updateCard(terminalId);
-    if (settled) await this.announceReply(terminalId, settled);
+    if (settled) await this.announceReply(terminalId, settled, replyCheck);
   }
 
   /**
@@ -331,8 +458,21 @@ export class SessionController {
    * A turn with an origin goes where its prompt came from instead, and the
    * thread root is remembered so a reply in that thread finds this agent.
    */
-  async announceReply(terminalId: string, turnId: string): Promise<void> {
-    const { registry, transport, log } = this.deps;
+  async announceReply(
+    terminalId: string,
+    turnId: string,
+    captured?: {
+      ref: string;
+      paneId: string;
+      workspaceId: string;
+      sessionPath: string | undefined;
+      boundary: PiBoundary | undefined;
+      identity: string | undefined;
+      origin: { channel: string; threadTs?: string } | undefined;
+      allowUnavailablePiNotice?: boolean;
+    },
+  ): Promise<void> {
+    const { registry, transport, log, state } = this.deps;
     const record = registry.get(terminalId);
     if (!record || record.ended) return;
 
@@ -345,6 +485,61 @@ export class SessionController {
         : undefined);
     if (!target) return;
     if (!isSubstantiveResponse(turn.response)) return;
+    const initialPane = state.paneByTerminal(terminalId);
+    const expected = captured ?? {
+      ref: record.ref,
+      paneId: initialPane?.pane_id ?? "",
+      workspaceId: initialPane?.workspace_id ?? "",
+      sessionPath: initialPane?.agent_session?.value,
+      boundary: turn.piBoundary,
+      identity: record.lastPiResponseId,
+      origin: turn.origin,
+    };
+    const valid = () => {
+      const liveRecord = registry.get(terminalId);
+      const live = state.paneByTerminal(terminalId);
+      const currentTurn = registry.turns(terminalId).at(-1);
+      return Boolean(
+        liveRecord &&
+          !liveRecord.ended &&
+          liveRecord.ref === expected.ref &&
+          live?.agent &&
+          live.pane_id === expected.paneId &&
+          live.workspace_id === expected.workspaceId &&
+          this.deps.isHerdrConnected?.() !== false &&
+          currentTurn?.id === turnId &&
+          !currentTurn.deliveryPending &&
+          currentTurn.status !== "working" &&
+          currentTurn.response === turn.response &&
+          currentTurn.origin?.channel === expected.origin?.channel &&
+          currentTurn.origin?.threadTs === expected.origin?.threadTs &&
+          (!currentTurn.origin || currentTurn.expectedWorkspaceId === expected.workspaceId) &&
+          currentTurn.piBoundary === expected.boundary &&
+          (live.agent !== "pi" ||
+            (live.agent_session?.agent === "pi" &&
+              live.agent_session.kind === "path" &&
+              live.agent_session.source === "herdr:pi" &&
+              live.agent_session.value === expected.sessionPath &&
+              liveRecord.lastPiResponseId === expected.identity)),
+      );
+    };
+    if (!valid()) return;
+    if (turn.piBoundary) {
+      const file = await readPiSession(expected.sessionPath, turn.piBoundary);
+      if (
+        file.kind !== "ready" &&
+        file.kind !== "failed" &&
+        !(
+          file.kind === "unavailable" &&
+          captured?.allowUnavailablePiNotice &&
+          turn.status === "failed" &&
+          turn.response.startsWith("Pi reply unavailable: ")
+        )
+      )
+        return;
+      if (file.kind === "ready" && file.identity !== expected.identity) return;
+      if (!valid()) return;
+    }
     if (!registry.claimTurnNotification(terminalId, turnId)) return;
     registry.save();
 
@@ -470,19 +665,235 @@ export class SessionController {
       .catch((error) => log(`card update failed: ${(error as Error).message}`));
   }
 
+  /** Read Pi's trusted session leaf before the launcher sends the first prompt. */
+  async launchBoundary(terminalId: string): Promise<PiBoundary> {
+    const pane = this.deps.state.paneByTerminal(terminalId);
+    if (
+      pane?.agent !== "pi" ||
+      pane.agent_session?.kind !== "path" ||
+      pane.agent_session.agent !== "pi" ||
+      pane.agent_session.source !== "herdr:pi"
+    )
+      throw new Error("Pi session is unavailable.");
+    const result = await readPiSession(pane.agent_session.value);
+    if (result.kind !== "boundary" || this.deps.state.paneByTerminal(terminalId) !== pane)
+      throw new Error("Pi session is unavailable.");
+    return result.boundary;
+  }
+
+  /** Persist the launch boundary and an undeliverable turn before the launcher sends text. */
+  async preparePiLaunchTurn(
+    terminalId: string,
+    prompt: string,
+    workspaceId: string | undefined,
+    origin?: { channel: string; threadTs?: string },
+  ): Promise<{
+    terminalId: string;
+    turnId: string;
+    ref: string;
+    paneId: string;
+    workspaceId: string;
+    boundary: PiBoundary;
+  }> {
+    const pane = this.deps.state.paneByTerminal(terminalId);
+    if (
+      !pane?.agent ||
+      (workspaceId && pane.workspace_id !== workspaceId) ||
+      this.deps.isHerdrConnected?.() === false ||
+      !isEligibleCreRoot(this.deps.config, pane)
+    )
+      throw new Error("Pi launch target is unavailable.");
+    const boundary = await this.launchBoundary(terminalId);
+    if (
+      this.deps.state.paneByTerminal(terminalId) !== pane ||
+      this.deps.isHerdrConnected?.() === false ||
+      this.deps.registry.activeTurn(terminalId)
+    )
+      throw new Error("Pi launch target changed.");
+    const { registry, state } = this.deps;
+    const record = registry.upsert(terminalId, {
+      lastKnownPaneId: pane.pane_id,
+      agentKind: pane.agent,
+      title: pane.terminal_title_stripped ?? pane.title ?? "",
+      cwd: pane.cwd ?? "",
+      workspaceId: pane.workspace_id,
+      tabId: pane.tab_id,
+      lastStatus: state.statusOf(terminalId) ?? pane.agent_status,
+    });
+    const turn = registry.startTurn(
+      terminalId,
+      prompt,
+      "",
+      origin,
+      Date.now(),
+      boundary,
+      workspaceId ?? pane.workspace_id,
+    );
+    if (!turn) throw new Error("Pi launch turn is unavailable.");
+    registry.updateTurn(terminalId, turn.id, { deliveryPending: true });
+    try {
+      registry.save();
+    } catch (error) {
+      registry.discardTurn(terminalId, turn.id);
+      throw error;
+    }
+    return {
+      terminalId,
+      turnId: turn.id,
+      ref: record.ref,
+      paneId: pane.pane_id,
+      workspaceId: workspaceId ?? pane.workspace_id,
+      boundary,
+    };
+  }
+
+  /** A failed or invalidated launch stays pending across restart. */
+  async confirmPiLaunchTurn(
+    captured: Awaited<ReturnType<SessionController["preparePiLaunchTurn"]>>,
+  ): Promise<boolean> {
+    const { terminalId, turnId, ref, paneId, workspaceId, boundary } = captured;
+    const { state, registry } = this.deps;
+    const pane = state.paneByTerminal(terminalId);
+    const turn = registry.activeTurn(terminalId);
+    if (
+      !pane ||
+      pane.agent !== "pi" ||
+      pane.pane_id !== paneId ||
+      pane.workspace_id !== workspaceId ||
+      pane.agent_session?.agent !== "pi" ||
+      pane.agent_session.kind !== "path" ||
+      pane.agent_session.source !== "herdr:pi" ||
+      pane.agent_session.value !== boundary.path ||
+      registry.get(terminalId)?.ref !== ref ||
+      turn?.id !== turnId ||
+      turn.piBoundary !== boundary ||
+      !turn.deliveryPending ||
+      this.deps.isHerdrConnected?.() === false
+    )
+      return false;
+    registry.updateTurn(terminalId, turnId, { deliveryPending: false });
+    registry.save();
+    await this.refreshResponse(terminalId);
+    return true;
+  }
+
   /** Send free text as a prompt. herdr handles paste mode and the Enter. */
-  async prompt(terminalId: string, text: string): Promise<ActionOutcome> {
+  async prompt(
+    terminalId: string,
+    text: string,
+    expectedWorkspaceId?: string,
+    origin?: { channel: string; threadTs?: string },
+    baseline?: string,
+  ): Promise<ActionOutcome> {
     if (!this.isLive(terminalId)) return { ok: false, message: SESSION_OVER };
     if (!isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId)))
       return { ok: false, message: "Unverified CRE root." };
-    const paneId = this.#currentPane(terminalId);
+    if (
+      expectedWorkspaceId &&
+      this.deps.state.paneByTerminal(terminalId)?.workspace_id !== expectedWorkspaceId
+    )
+      return { ok: false, message: "That agent is not in this workspace." };
+    const pane = this.deps.state.paneByTerminal(terminalId);
+    const paneId = pane?.pane_id;
     if (!paneId) return { ok: false, message: SESSION_OVER };
+    let piBoundary: PiBoundary | undefined;
+    if (pane.agent === "pi") {
+      if (
+        this.deps.isHerdrConnected?.() === false ||
+        pane.agent_session?.kind !== "path" ||
+        pane.agent_session.agent !== "pi" ||
+        pane.agent_session.source !== "herdr:pi" ||
+        this.deps.registry.get(terminalId)?.piClearedPath === pane.agent_session.value
+      )
+        return {
+          ok: false,
+          message: "Pi session is unavailable; wait for herdr to report its new session.",
+        };
+      const before = await readPiSession(pane.agent_session.value);
+      if (before.kind !== "boundary")
+        return {
+          ok: false,
+          message: before.kind === "unavailable" ? before.reason : "Pi session is unavailable.",
+        };
+      piBoundary = before.boundary;
+      if (this.deps.state.paneByTerminal(terminalId) !== pane)
+        return { ok: false, message: "Pi session changed before prompt delivery." };
+    }
+    const previous = this.deps.registry.activeTurn(terminalId);
+    const pending =
+      baseline === undefined || previous
+        ? undefined
+        : this.deps.registry.startTurn(
+            terminalId,
+            text,
+            baseline,
+            origin,
+            Date.now(),
+            piBoundary,
+            expectedWorkspaceId,
+          );
+    if (baseline !== undefined && !previous && !pending)
+      return { ok: false, message: SESSION_OVER };
+    if (baseline !== undefined) {
+      this.#settledDuringDelivery.delete(terminalId);
+      this.#inflightTurn.set(terminalId, (previous ?? pending)?.id ?? "");
+      if (previous)
+        this.deps.registry.updateTurn(terminalId, previous.id, { deliveryPending: true });
+      else if (pending)
+        this.deps.registry.updateTurn(terminalId, pending.id, { deliveryPending: true });
+      this.deps.registry.save();
+    }
+    const releasePending = () => {
+      this.#settledDuringDelivery.delete(terminalId);
+      this.#inflightTurn.delete(terminalId);
+      if (pending) this.deps.registry.discardTurn(terminalId, pending.id);
+      if (previous)
+        this.deps.registry.updateTurn(terminalId, previous.id, { deliveryPending: false });
+      this.deps.registry.save();
+    };
     try {
-      // No wait: replies arrive via transition events, not this call.
+      // A fast status edge cannot settle until herdr acknowledges delivery.
       await this.deps.client.prompt(paneId, text);
+      if (
+        expectedWorkspaceId &&
+        (this.deps.state.paneByTerminal(terminalId)?.workspace_id !== expectedWorkspaceId ||
+          !this.isLive(terminalId))
+      ) {
+        // Herdr acknowledged a prompt, but its authorized workspace is gone.
+        // Keep the saved turn non-deliverable even if the terminal moves back.
+        this.#settledDuringDelivery.delete(terminalId);
+        this.#inflightTurn.delete(terminalId);
+        return { ok: false, message: "That agent is not in this workspace." };
+      }
+      const active = this.deps.registry.activeTurn(terminalId);
+      if (active && (piBoundary || origin)) {
+        this.deps.registry.updateTurn(terminalId, active.id, {
+          ...(piBoundary ? { piBoundary } : {}),
+          ...(origin ? { origin, ...(expectedWorkspaceId ? { expectedWorkspaceId } : {}) } : {}),
+        });
+        this.deps.registry.save();
+      }
+      if (baseline !== undefined) {
+        if (active)
+          this.deps.registry.updateTurn(terminalId, active.id, { deliveryPending: false });
+        this.deps.registry.save();
+        const settled = this.#settledDuringDelivery.get(terminalId);
+        this.#settledDuringDelivery.delete(terminalId);
+        this.#inflightTurn.delete(terminalId);
+        if (settled) await this.refreshResponse(terminalId, settled);
+        else if (piBoundary) await this.refreshResponse(terminalId);
+      }
       this.deps.log(`prompt sent to ${terminalId} (${text.length} chars)`);
-      return { ok: true };
+      return { ok: true, ...(piBoundary ? { piBoundary } : {}) };
     } catch (error) {
+      // A failed acknowledgment does not prove a steered prompt was not delivered.
+      if (baseline !== undefined) {
+        if (previous) {
+          this.#settledDuringDelivery.delete(terminalId);
+          this.#inflightTurn.delete(terminalId);
+          this.deps.registry.save();
+        } else releasePending();
+      }
       return { ok: false, message: this.#explain(error) };
     }
   }
@@ -509,11 +920,94 @@ export class SessionController {
 
   /** Send a bare digit for numbered menus; prompt would append Enter. */
   async chooseMenuOption(terminalId: string, choice: string): Promise<ActionOutcome> {
-    const paneId = this.#currentPane(terminalId);
-    if (!paneId) return { ok: false, message: "That session has ended." };
+    const pane = this.deps.state.paneByTerminal(terminalId);
+    if (!pane) return { ok: false, message: "That session has ended." };
+    let piBoundary: PiBoundary | undefined;
+    if (pane.agent === "pi") {
+      const session = pane.agent_session;
+      const before = await readPiSession(
+        session?.agent === "pi" && session.kind === "path" && session.source === "herdr:pi"
+          ? session.value
+          : undefined,
+      );
+      if (before.kind !== "boundary" || this.deps.state.paneByTerminal(terminalId) !== pane)
+        return { ok: false, message: "Pi session is unavailable." };
+      piBoundary = before.boundary;
+    }
     try {
-      await this.deps.client.sendKeys(paneId, [choice]);
+      await this.deps.client.sendKeys(pane.pane_id, [choice]);
+      const active =
+        this.deps.registry.activeTurn(terminalId) ?? this.deps.registry.turns(terminalId).at(-1);
+      if (
+        piBoundary &&
+        active &&
+        !active.piBoundary &&
+        (active.status === "working" || active.status === "blocked")
+      ) {
+        this.deps.registry.updateTurn(terminalId, active.id, { piBoundary });
+        this.deps.registry.save();
+      }
       this.deps.log(`menu choice ${choice} sent to ${terminalId}`);
+      return { ok: true, ...(piBoundary ? { piBoundary } : {}) };
+    } catch (error) {
+      return { ok: false, message: this.#explain(error) };
+    }
+  }
+
+  /** Interrupt a live agent without ending its turn. */
+  async interrupt(terminalId: string, expectedWorkspaceId?: string): Promise<ActionOutcome> {
+    if (!this.isLive(terminalId)) return { ok: false, message: SESSION_OVER };
+    if (!isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId)))
+      return { ok: false, message: "Unverified CRE root." };
+    if (
+      expectedWorkspaceId &&
+      this.deps.state.paneByTerminal(terminalId)?.workspace_id !== expectedWorkspaceId
+    )
+      return { ok: false, message: "That agent is not in this workspace." };
+    const paneId = this.#currentPane(terminalId);
+    if (!paneId) return { ok: false, message: SESSION_OVER };
+    try {
+      await this.deps.client.sendKeys(paneId, INTERRUPT_KEYS);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, message: this.#explain(error) };
+    }
+  }
+
+  /** Clear the agent context and restore the name that /new removes. */
+  async clear(terminalId: string, expectedWorkspaceId?: string): Promise<ActionOutcome> {
+    if (!this.isLive(terminalId)) return { ok: false, message: SESSION_OVER };
+    if (!isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId)))
+      return { ok: false, message: "Unverified CRE root." };
+    if (
+      expectedWorkspaceId &&
+      this.deps.state.paneByTerminal(terminalId)?.workspace_id !== expectedWorkspaceId
+    )
+      return { ok: false, message: "That agent is not in this workspace." };
+    const pane = this.deps.state.paneByTerminal(terminalId);
+    const paneId = pane?.pane_id;
+    const name = this.deps.state.nameOf(terminalId);
+    if (!paneId || !name) return { ok: false, message: "That agent has no name." };
+    try {
+      await this.deps.client.prompt(paneId, CLEAR_PROMPT);
+      if (pane.agent === "pi") {
+        const record = this.deps.registry.get(terminalId);
+        if (record && pane.agent_session?.value) record.piClearedPath = pane.agent_session.value;
+        const active = this.deps.registry.activeTurn(terminalId);
+        if (active)
+          this.deps.registry.updateTurn(terminalId, active.id, {
+            status: "stopped",
+            completedAt: Date.now(),
+          });
+        this.deps.registry.save();
+      }
+      if (!this.isLive(terminalId)) return { ok: false, message: SESSION_OVER };
+      const currentPane = this.deps.state.paneByTerminal(terminalId);
+      if (expectedWorkspaceId && currentPane?.workspace_id !== expectedWorkspaceId)
+        return { ok: false, message: "That agent is not in this workspace." };
+      const current = currentPane?.pane_id;
+      if (!current) return { ok: false, message: SESSION_OVER };
+      await this.deps.client.request("agent.rename", { target: current, name });
       return { ok: true };
     } catch (error) {
       return { ok: false, message: this.#explain(error) };

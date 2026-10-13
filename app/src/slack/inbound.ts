@@ -38,6 +38,8 @@ export function contextFromPayload(payload: AnyRecord, fallbackTeamId = ""): Inb
   const user = rec(payload.user);
   const channel = rec(payload.channel);
   const container = rec(payload.container);
+  const message = rec(payload.message);
+  const threadTs = str(container?.thread_ts) || str(message?.thread_ts);
 
   return {
     teamId: str(team?.id) || str(payload.team_id) || fallbackTeamId,
@@ -45,6 +47,6 @@ export function contextFromPayload(payload: AnyRecord, fallbackTeamId = ""): Inb
     channel: str(channel?.id) || str(container?.channel_id),
     surface: surfaceOf(payload),
     ...(container?.message_ts ? { ts: str(container.message_ts) } : {}),
-    ...(container?.thread_ts ? { threadTs: str(container.thread_ts) } : {}),
+    ...(threadTs ? { threadTs } : {}),
   };
 }

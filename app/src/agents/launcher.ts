@@ -2,6 +2,7 @@ import type { HerdrClient } from "../herdr/client.js";
 import { HerdrError } from "../herdr/types.js";
 import { RESERVED } from "../slack/commands.js";
 import type { AgentMode } from "./catalog.js";
+import type { PiBoundary } from "./pi-session.js";
 
 /** How long to wait for a freshly created tab's shell to settle. */
 export const SHELL_READY_TIMEOUT_MS = 5_000;
@@ -20,6 +21,8 @@ export interface LaunchRequest {
   /** Unique among live agents; herdr enforces [a-z][a-z0-9_-]{0,31}. */
   name: string;
   firstPrompt?: string;
+  /** Capture the local Pi session leaf before the first prompt reaches the TUI. */
+  beforeFirstPrompt?: (paneId: string) => Promise<PiBoundary>;
   /** Typed into the shell instead of `agent.start` (catalog `command`). */
   command?: string | undefined;
 }
@@ -31,6 +34,7 @@ export interface LaunchResult {
   message?: string;
   /** Present only when a first prompt was asked for; false means it was lost. */
   promptDelivered?: boolean;
+  piBoundary?: PiBoundary;
 }
 
 /** How many names to try before giving up on finding a free one. */
@@ -185,6 +189,20 @@ export async function launchAgent(
     // Nor does registration mean the TUI accepts input: a first-run agent can
     // still be on a welcome or trust screen, which swallows anything typed.
     await waitForInputReady(client, paneId, agentReadyTimeoutMs);
+    let piBoundary: PiBoundary | undefined;
+    if (request.beforeFirstPrompt) {
+      try {
+        piBoundary = await request.beforeFirstPrompt(paneId);
+      } catch {
+        return {
+          ok: true,
+          paneId,
+          tabId,
+          promptDelivered: false,
+          message: "Started, but the first prompt was not sent: Pi session is unavailable.",
+        };
+      }
+    }
     try {
       await promptWithRetry(client, paneId, request.firstPrompt.trim(), sleep);
     } catch (error) {
@@ -197,7 +215,13 @@ export async function launchAgent(
         message: `Started, but the first prompt did not land: ${explain(error, "prompt failed")}`,
       };
     }
-    return { ok: true, paneId, tabId, promptDelivered: true };
+    return {
+      ok: true,
+      paneId,
+      tabId,
+      promptDelivered: true,
+      ...(piBoundary ? { piBoundary } : {}),
+    };
   }
 
   return { ok: true, paneId, tabId };

@@ -163,6 +163,8 @@ export interface NewAgentModel extends NewAgentTargets {
    * trip to submission.
    */
   selectedHerdId?: string | undefined;
+  lockedWorkspaceId?: string | undefined;
+  origin?: { channel: string; threadTs?: string } | undefined;
 }
 
 /**
@@ -178,7 +180,11 @@ export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown
     value: entry.kind,
   }));
 
-  const selected = model.selectedKind ?? model.defaults?.kind ?? model.kinds[0]?.kind ?? "";
+  const selected =
+    model.selectedKind ??
+    (model.lockedWorkspaceId ? "cre" : model.defaults?.kind) ??
+    model.kinds[0]?.kind ??
+    "";
 
   const directories: Option[] = [
     ...(model.favouriteDirs ?? []).map((dir) => ({ label: dir, value: dir })),
@@ -198,7 +204,11 @@ export function buildNewAgentModal(model: NewAgentModel): Record<string, unknown
   }
 
   const workspaces = model.workspaces.map((w) => ({ label: w.label || w.id, value: w.id }));
-  if (hasOptions(workspaces)) {
+  if (model.lockedWorkspaceId) {
+    const label =
+      workspaces.find((w) => w.value === model.lockedWorkspaceId)?.label ?? model.lockedWorkspaceId;
+    blocks.push(note(`Workspace: *${escapeMrkdwn(label)}*`));
+  } else if (hasOptions(workspaces)) {
     blocks.push(
       selectBlock(BLOCK_IDS.workspace, ACTION_IDS.workspace, "Workspace", workspaces, {
         optional: true,
@@ -251,7 +261,16 @@ function shell(model: NewAgentModel): Block {
     type: "modal",
     callback_id: MODAL_IDS.newAgent,
     // Carries the target herd even when there is no picker to read it back from.
-    private_metadata: model.selectedHerdId ?? "",
+    private_metadata: JSON.stringify({
+      herdId: model.selectedHerdId ?? "",
+      ...(model.lockedWorkspaceId ? { workspaceId: model.lockedWorkspaceId } : {}),
+      ...(model.origin
+        ? {
+            channel: model.origin.channel,
+            ...(model.origin.threadTs ? { threadTs: model.origin.threadTs } : {}),
+          }
+        : {}),
+    }),
     title: text("New agent"),
     close: text("Cancel"),
   };
@@ -392,8 +411,10 @@ export interface NewAgentSubmission {
   kind: string;
   label?: string;
   firstPrompt?: string;
-  /** Which herd to launch on; absent means the local one. */
-  herdId?: string;
+  /** A launch must name its herd in modal metadata. */
+  herdId: string;
+  channel?: string;
+  threadTs?: string;
 }
 
 type ViewState = {
@@ -420,7 +441,24 @@ export function parseNewAgentSubmission(
   const kind = pick(BLOCK_IDS.kind, ACTION_IDS.kind);
   if (!kind) return null;
 
-  const herdId = privateMetadata.trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(privateMetadata);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const metadata = parsed as Record<string, unknown>;
+  const field = (key: string): string | undefined =>
+    typeof metadata[key] === "string" && metadata[key] ? (metadata[key] as string) : undefined;
+  const herdId = field("herdId");
+  if (
+    !herdId ||
+    ["workspaceId", "channel", "threadTs"].some((key) => metadata[key] !== undefined && !field(key))
+  )
+    return null;
+  const channel = field("channel");
+  const threadTs = field("threadTs");
 
   // A typed path wins over the picker: someone who typed one meant it.
   const typed = pick(BLOCK_IDS.directoryOther, ACTION_IDS.directoryOther)?.trim();
@@ -435,10 +473,14 @@ export function parseNewAgentSubmission(
   // presence meaning "the user chose something".
   return {
     kind,
-    ...(workspaceId ? { workspaceId } : {}),
+    ...((field("workspaceId") ?? workspaceId)
+      ? { workspaceId: (field("workspaceId") ?? workspaceId) as string }
+      : {}),
     ...(cwd ? { cwd } : {}),
     ...(label ? { label } : {}),
     ...(firstPrompt ? { firstPrompt } : {}),
-    ...(herdId ? { herdId } : {}),
+    herdId,
+    ...(channel ? { channel } : {}),
+    ...(channel && threadTs ? { threadTs } : {}),
   };
 }

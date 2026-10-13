@@ -37,6 +37,9 @@ describe("HerdrClient collection helpers", () => {
   it("lists worktrees", async () => {
     fake.on("worktree.list", () => ({ worktrees: [] }));
     await expect(client.worktreeList()).resolves.toEqual([]);
+    expect(fake.requests.at(-1)?.params).toEqual({});
+    await expect(client.worktreeList("w2")).resolves.toEqual([]);
+    expect(fake.requests.at(-1)?.params).toEqual({ workspace_id: "w2" });
   });
 
   it("passes a line limit through when asked", async () => {

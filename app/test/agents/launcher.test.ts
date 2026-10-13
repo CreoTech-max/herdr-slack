@@ -136,6 +136,43 @@ describe("launchAgent", () => {
     expect(result.message).toContain("no pane");
   });
 
+  it("captures the Pi boundary before a fast first reply and never prompts when capture fails", async () => {
+    tabCreates();
+    fake.on("pane.process_info", () => ({ process: { foreground_command: null } }));
+    fake.on("agent.start", () => ({ ok: true }));
+    fake.on("agent.get", () => ({ agent: { agent: "pi" } }));
+    fake.on("agent.prompt", () => ({ ok: true }));
+    const seen: string[] = [];
+    const captured = await launchAgent(
+      client,
+      request({
+        firstPrompt: "fast",
+        beforeFirstPrompt: async (paneId: string) => {
+          seen.push(`capture:${paneId}`);
+          expect(fake.requests.filter((row) => row.method === "agent.prompt")).toHaveLength(0);
+          return { path: "/trusted/file.jsonl", sessionId: "EXAMPLE", entryId: null };
+        },
+      }),
+      { sleep: noSleep },
+    );
+    expect(captured).toMatchObject({ promptDelivered: true, piBoundary: { sessionId: "EXAMPLE" } });
+    expect(seen).toEqual(["capture:w1:p9"]);
+    fake.requests.length = 0;
+    const rejected = await launchAgent(
+      client,
+      request({
+        firstPrompt: "do not send",
+        beforeFirstPrompt: async () => {
+          throw new Error("unsafe path");
+        },
+      }),
+      { sleep: noSleep },
+    );
+    expect(rejected).toMatchObject({ ok: true, promptDelivered: false });
+    expect(fake.requests.filter((row) => row.method === "agent.prompt")).toHaveLength(0);
+    expect(rejected.message).not.toContain("unsafe path");
+  });
+
   it("sends the first prompt after the agent is up", async () => {
     tabCreates();
     fake.on("pane.process_info", () => ({ process: { foreground_command: null } }));

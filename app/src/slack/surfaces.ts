@@ -3,12 +3,14 @@ import { readLastLaunch, writeLastLaunch } from "../agents/last-launch.js";
 import { launchAgent, sanitizeAgentName } from "../agents/launcher.js";
 import type { InstanceConfig } from "../config/config.js";
 import type { RateBudget } from "../daemon/budget.js";
-import { decodeHerdRef } from "../daemon/herd-registry.js";
+import { decodeHerdRef, encodeHerdRef } from "../daemon/herd-registry.js";
 import type { HerdrClient } from "../herdr/client.js";
 import type { EventTail } from "../herdr/events.js";
 import type { SessionState } from "../herdr/state.js";
 import type { AgentStatus } from "../herdr/types.js";
+import { saveBindings } from "../registry/bindings.js";
 import { type SessionRegistry, sweepOrphans } from "../registry/registry.js";
+import { type MentionCommand, parseMention } from "./commands.js";
 import { isEligibleCreRoot } from "./cre-roots.js";
 import { escapeMrkdwn } from "./format.js";
 import {
@@ -38,11 +40,14 @@ import {
   buildHistoryModal,
   buildNewAgentModal,
   buildReplyModal,
+  capOptions,
   messageModal,
+  option,
   parseNewAgentSubmission,
   parseReplySubmission,
   skeletonModal,
 } from "./modals.js";
+import { redact } from "./redact.js";
 import { SessionController } from "./session-controller.js";
 import { SESSION_ACTIONS } from "./session.js";
 import type { InboundContext, SlackTransport, ViewSubmitResult } from "./transport.js";
@@ -65,9 +70,24 @@ export const CURSOR_IDLE_ACTIVITY_MS = 15_000;
 /** Debounce Home republish after state changes. */
 const HOME_DEBOUNCE_MS = 5_000;
 
+/** Slack user mention markup, `<@U123>` or `<@U123|label>`. */
+const MENTION = /<@([UW][A-Z0-9]+)(?:\|[^<>]*)?>/g;
+/** Fenced or inline mrkdwn code, kept literal; `split` puts it at odd indices. */
+const CODE = /(```[\s\S]*?```|`[^`\n]*`)/;
+/** A Slack `user.name`: one bounded token with no whitespace or markup. */
+const SLACK_USERNAME = /^[\w.-]{1,80}$/;
+
+/** Rewrite user mention tokens outside code spans. */
+const mapMentions = (text: string, label: (token: string, id: string) => string): string =>
+  text
+    .split(CODE)
+    .map((part, i) => (i % 2 ? part : part.replace(MENTION, label)))
+    .join("");
+
 interface NoticeTarget {
   userId?: string | undefined;
   threadTs?: string | undefined;
+  blocks?: unknown[] | undefined;
 }
 
 export interface SurfacesDeps {
@@ -157,37 +177,61 @@ export class Surfaces {
     transport.onMention(async ({ ctx, text }) => this.#mention(ctx, text));
     transport.onMessage(async ({ ctx, text }) => {
       this.#lastActor = ctx.userId;
+      if (text.trimStart().startsWith(`<@${this.deps.config.slack.botUserId}>`)) {
+        await this.#mention({ ...ctx, surface: "mention" }, text);
+        return;
+      }
+      if (!this.#markMessageSeen(ctx)) return;
       const decision = checkInbound(this.#guards, ctx);
       if (!decision.allowed) {
         log(`message denied: ${decision.reason}`);
         return;
       }
-      if (!ctx.threadTs) {
-        if (!this.#markMessageSeen(ctx)) {
-          log(`duplicate bare message ignored ts=${ctx.ts ?? ctx.eventId ?? "?"}`);
+      if (ctx.threadTs) {
+        const terminalId = registry.terminalForReplyPost(ctx.channel, ctx.threadTs);
+        if (terminalId) {
+          await this.#promptAt(terminalId, text, ctx);
           return;
         }
+        const bound = this.#binding(ctx.channel);
+        const peer =
+          bound && bound.herdId !== this.#localHerdId()
+            ? this.deps.herd
+                ?.peerAgents(bound.herdId)
+                .find(
+                  (agent) =>
+                    agent.workspaceId === bound.workspaceId &&
+                    agent.replyPosts?.some(
+                      (post) => post.channel === ctx.channel && post.ts === ctx.threadTs,
+                    ),
+                )
+            : undefined;
+        if (bound && peer?.ref && this.#herdReachable(bound.herdId)) {
+          this.deps.herd?.forwardCommand({
+            op: "prompt",
+            herdId: bound.herdId,
+            ref: peer.ref,
+            expectedWorkspaceId: bound.workspaceId,
+            channel: ctx.channel,
+            threadTs: ctx.threadTs,
+            userId: ctx.userId,
+            text,
+          });
+        }
+        return;
+      }
+      if (!ctx.channel.startsWith("D")) return;
+      const command = parseMention(text, this.deps.config.slack.botUserId);
+      if (
+        command.kind === "unknown" ||
+        (command.kind === "agent" &&
+          !this.#localAgent(command.name, ctx.channel) &&
+          !this.#peerAgent(command.name, ctx.channel))
+      ) {
         await this.#handleBareMessage(ctx.channel, ctx.userId, text);
         return;
       }
-      if (!this.#markMessageSeen(ctx)) return;
-      const terminalId = this.terminalForThread(ctx.threadTs, ctx.channel);
-      if (!terminalId) {
-        await this.#ephemeral(
-          ctx.channel,
-          "I do not recognise this thread — open a session first.",
-          {
-            userId: ctx.userId,
-            threadTs: ctx.threadTs,
-          },
-        );
-        return;
-      }
-      await this.#ephemeral(
-        ctx.channel,
-        "Use *Reply* on the session card so prompts stay attached to a single remote turn.",
-        { userId: ctx.userId, threadTs: ctx.threadTs },
-      );
+      await this.#handleMention(ctx, command);
     });
 
     // Debounce Home refresh on structural changes to protect the write budget.
@@ -198,6 +242,7 @@ export class Surfaces {
     });
     tail.on("ready", () => {
       this.reconcileSessions();
+      this.#resumePendingPiTurns();
       this.#scheduleHome();
       this.#scheduleChannel();
     });
@@ -209,6 +254,7 @@ export class Surfaces {
     // and only grows large when reconciling is genuinely failing.
     tail.on("synced", () => {
       this.#lastSyncAt = Date.now();
+      this.#resumePendingPiTurns();
       this.#scheduleHome();
     });
     tail.on("status", () => {
@@ -270,6 +316,27 @@ export class Surfaces {
     }
   }
 
+  /** Snapshots do not replay status edges for turns that settled while disconnected. */
+  #resumePendingPiTurns(): void {
+    for (const pane of this.deps.state.agentPanes()) {
+      const turn = this.deps.registry.activeTurn(pane.terminal_id);
+      if (!turn?.piBoundary || turn.deliveryPending || pane.agent !== "pi") continue;
+      if (
+        pane.agent_status === "done" ||
+        pane.agent_status === "idle" ||
+        pane.agent_status === "blocked"
+      )
+        void this.#sessions.refreshResponse(
+          pane.terminal_id,
+          pane.agent_status === "blocked"
+            ? "blocked"
+            : pane.agent_status === "done"
+              ? "done"
+              : undefined,
+        );
+    }
+  }
+
   /** Close threads whose agent exited but the pane remains. */
   async #reapDeadSessions(): Promise<void> {
     const { state, registry } = this.deps;
@@ -304,7 +371,6 @@ export class Surfaces {
 
   /** Drop Slack retries and duplicate deliveries of the same message ts. */
   #markMessageSeen(ctx: InboundContext): boolean {
-    if (ctx.retryNum !== undefined && ctx.retryNum > 0) return false;
     const key = inboundMessageDedupeKey(ctx);
     if (!key) return true;
     if (this.#seenMessageKeys.has(key)) return false;
@@ -383,6 +449,7 @@ export class Surfaces {
     privateMetadata?: string;
   }): Promise<ViewSubmitResult | undefined> {
     const { ctx, callbackId, view, privateMetadata } = input;
+    this.#lastActor = ctx.userId;
     const { log } = this.deps;
     const decision = checkInbound(this.#guards, ctx);
     if (!decision.allowed) {
@@ -393,12 +460,19 @@ export class Surfaces {
     // not grounds to refuse it; the target's reachability is checked on arrival.
     if (callbackId === MODAL_IDS.newAgent) {
       if (this.deps.config.creOnly) return;
-      await this.#launchFromModal(
-        ctx.userId,
-        await this.#replyChannel(ctx),
-        view,
-        privateMetadata ?? "",
-      );
+      const submission = parseNewAgentSubmission(view, privateMetadata ?? "");
+      if (!submission)
+        return { errors: { [BLOCK_IDS.kind]: "Choose an agent, or reopen this form." } };
+      const channel = submission.channel ?? (await this.#replyChannel(ctx));
+      try {
+        await this.#launchFromModal(ctx.userId, channel, view, privateMetadata ?? "");
+      } catch {
+        log("launch result unknown; inspect Home before another submission");
+        await this.#ephemeral(
+          channel,
+          "Launch result unknown — check Home before you open a new form.",
+        ).catch(() => undefined);
+      }
       return;
     }
     const herdr = requireHerdr(this.#guards);
@@ -432,11 +506,15 @@ export class Surfaces {
    * the form never asks. From the overview there would be nothing to infer —
    * which is exactly why the button is not there.
    */
-  async #openNewAgentModal(triggerId: string, herdId: string): Promise<void> {
+  async #openNewAgentModal(
+    triggerId: string,
+    herdId: string,
+    origin?: { workspaceId: string; channel: string; threadTs?: string },
+  ): Promise<void> {
     // Skeleton first: trigger_id expires in about three seconds, well inside
     // the time herdr can take to answer.
     const viewId = await this.deps.transport.openModal(triggerId, skeletonModal("New agent"));
-    await this.#renderNewAgentModal(viewId, herdId);
+    await this.#renderNewAgentModal(viewId, herdId, origin);
   }
 
   /**
@@ -448,21 +526,38 @@ export class Surfaces {
    */
   #targetHerd(userId: string): string | null {
     const herds = this.deps.herd?.homeHerds() ?? [];
-    if (herds.length <= 1) return herds[0]?.herdId ?? this.deps.herd?.herdId ?? "";
+    if (herds.length <= 1) return herds[0]?.herdId ?? this.#localHerdId();
     const selection = this.#homeSelection.get(userId);
     return selection && selection !== ALL_HERDS ? selection : null;
   }
 
   /** Render the launch form for one herd. */
-  async #renderNewAgentModal(viewId: string, herdId: string): Promise<void> {
+  async #renderNewAgentModal(
+    viewId: string,
+    herdId: string,
+    origin?: { workspaceId: string; channel: string; threadTs?: string },
+  ): Promise<void> {
     const { herd } = this.deps;
-    const targets = await this.#launchTargets(herdId);
     // Last-launch defaults describe a workspace and a directory on *this*
     // machine, so they only apply when this machine is the target.
     const defaults = herdId === (herd?.herdId ?? "") ? readLastLaunch(this.deps.instance) : {};
+    const targets = await this.#launchTargets(herdId, origin?.workspaceId ?? defaults?.workspaceId);
     await this.#updateModal(
       viewId,
-      buildNewAgentModal({ ...targets, selectedHerdId: herdId, defaults }),
+      buildNewAgentModal({
+        ...targets,
+        selectedHerdId: herdId,
+        defaults,
+        ...(origin
+          ? {
+              lockedWorkspaceId: origin.workspaceId,
+              origin: {
+                channel: origin.channel,
+                ...(origin.threadTs ? { threadTs: origin.threadTs } : {}),
+              },
+            }
+          : {}),
+      }),
     );
   }
 
@@ -493,19 +588,21 @@ export class Surfaces {
   }
 
   /** Launch options for a herd: live from herdr locally, heartbeat for a peer. */
-  async #launchTargets(herdId: string): Promise<NewAgentTargets> {
+  async #launchTargets(herdId: string, workspaceId?: string): Promise<NewAgentTargets> {
     const { herd } = this.deps;
     const isLocal = !herd || herdId === herd.herdId;
     if (isLocal) {
       const [workspaces, worktrees] = await Promise.all([
         this.deps.client.workspaceList().catch(() => []),
-        this.deps.client.worktreeList().catch(() => []),
+        this.deps.client.worktreeList(workspaceId).catch(() => []),
       ]);
       return {
-        workspaces: workspaces.map((w) => ({
-          id: w.workspace_id,
-          label: w.label || w.workspace_id,
-        })),
+        workspaces: (workspaces.length ? workspaces : [...this.deps.state.workspaces.values()]).map(
+          (w) => ({
+            id: w.workspace_id,
+            label: w.label || w.workspace_id,
+          }),
+        ),
         worktrees: worktrees.map((tree) => ({
           label: tree.label,
           path: tree.path,
@@ -515,7 +612,13 @@ export class Surfaces {
       };
     }
     const remote = herd.launchOptionsFor(herdId);
-    return remote ?? { workspaces: [], worktrees: [], kinds: [] };
+    if (!remote) return { workspaces: [], worktrees: [], kinds: [] };
+    const selected =
+      workspaceId ?? (remote.workspaces.length === 1 ? remote.workspaces[0]?.id : undefined);
+    return {
+      ...remote,
+      worktrees: selected ? (remote.worktreesByWorkspace?.[selected] ?? []) : [],
+    };
   }
 
   /**
@@ -532,9 +635,10 @@ export class Surfaces {
   ): Promise<void> {
     herd.forwardCommand({
       op: "launch_agent",
-      herdId: submission.herdId ?? "",
+      herdId: submission.herdId,
       ref: "",
       channel,
+      ...(submission.threadTs ? { threadTs: submission.threadTs } : {}),
       userId,
       launch: {
         kind: submission.kind,
@@ -563,9 +667,27 @@ export class Surfaces {
       await this.#ephemeral(channel, "That form was missing an agent.");
       return;
     }
+    if (submission.channel) {
+      const bound = this.#binding(submission.channel);
+      if (
+        !bound ||
+        bound.herdId !== submission.herdId ||
+        bound.workspaceId !== submission.workspaceId
+      ) {
+        await this.#ephemeral(channel, "This channel is not bound to that workspace.");
+        return;
+      }
+    }
 
+    if (!this.#herdReachable(submission.herdId)) {
+      await this.#ephemeral(
+        channel,
+        "That herd is not reachable right now — wake the machine and start herdr.",
+      );
+      return;
+    }
     const { herd } = this.deps;
-    if (herd && submission.herdId && submission.herdId !== herd.herdId) {
+    if (herd && submission.herdId !== herd.herdId) {
       await this.#forwardLaunch(herd, submission, channel, userId);
       return;
     }
@@ -581,6 +703,7 @@ export class Surfaces {
     });
 
     const name = sanitizeAgentName(submission.label ?? submission.kind);
+    let launchTurn: Awaited<ReturnType<SessionController["preparePiLaunchTurn"]>> | undefined;
     const result = await launchAgent(this.deps.client, {
       kind: submission.kind,
       mode,
@@ -589,6 +712,28 @@ export class Surfaces {
       ...(submission.cwd ? { cwd: submission.cwd } : {}),
       ...(submission.label ? { label: submission.label } : {}),
       ...(submission.firstPrompt ? { firstPrompt: submission.firstPrompt } : {}),
+      ...(submission.firstPrompt && (entry?.command === "cre" || submission.kind === "pi")
+        ? {
+            beforeFirstPrompt: async (paneId: string) => {
+              if (!(await this.deps.tail.reconcile()))
+                throw new Error("Pi session is unavailable.");
+              const terminalId = this.deps.state.terminalByPane.get(paneId);
+              if (!terminalId) throw new Error("Pi terminal is unavailable.");
+              launchTurn = await this.#sessions.preparePiLaunchTurn(
+                terminalId,
+                submission.firstPrompt ?? "",
+                submission.workspaceId,
+                submission.channel
+                  ? {
+                      channel: submission.channel,
+                      ...(submission.threadTs ? { threadTs: submission.threadTs } : {}),
+                    }
+                  : undefined,
+              );
+              return launchTurn.boundary;
+            },
+          }
+        : {}),
       command: entry?.command,
     });
 
@@ -604,14 +749,38 @@ export class Surfaces {
       await this.#ephemeral(channel, `Could not start ${submission.kind}: ${result.message}`);
       return;
     }
+    let verifiedLaunch = true;
+    if (launchTurn && result.promptDelivered) {
+      verifiedLaunch =
+        (await this.deps.tail.reconcile()) &&
+        (await this.#sessions.confirmPiLaunchTurn(launchTurn));
+    } else if (
+      submission.channel &&
+      submission.firstPrompt &&
+      result.promptDelivered &&
+      result.paneId
+    ) {
+      await this.deps.tail.reconcile();
+      this.reconcileSessions();
+      const terminalId = this.deps.state.terminalByPane.get(result.paneId);
+      if (terminalId) {
+        this.deps.registry.startTurn(terminalId, submission.firstPrompt, "", {
+          channel: submission.channel,
+          ...(submission.threadTs ? { threadTs: submission.threadTs } : {}),
+        });
+        this.deps.registry.save();
+      }
+    }
     await this.#ephemeral(
       channel,
-      result.promptDelivered === false
-        ? `⚠️ Started *${submission.kind}*, but your first prompt did not reach it — ` +
+      !verifiedLaunch
+        ? `⚠️ Started *${submission.kind}*, but its first reply could not be verified. Open it from Home.`
+        : result.promptDelivered === false
+          ? `⚠️ Started *${submission.kind}*, but your first prompt did not reach it — ` +
             `open it from the *Home* tab and use *Reply* to send it. (${result.message})`
-        : result.message
-          ? `Started *${submission.kind}* — ${result.message}`
-          : `Started *${submission.kind}* in ${mode.label}. It will appear on the Home tab.`,
+          : result.message
+            ? `Started *${submission.kind}* — ${result.message}`
+            : `Started *${submission.kind}* in ${mode.label}. It will appear on the Home tab.`,
     );
     await this.publishHome(userId);
   }
@@ -805,6 +974,10 @@ export class Surfaces {
     // recognise that". Nothing in the form needs handling: it is read once, on
     // submit.
     if (MODAL_INPUT_ACTION_IDS.includes(actionId)) return;
+    if (actionId === "channel_bind_select" || actionId === "channel_new_agent") {
+      await this.#onChannelChrome(ctx, actionId, value, triggerId);
+      return;
+    }
     if (
       actionId === HOME_ACTIONS.refresh ||
       actionId === HOME_ACTIONS.newAgent ||
@@ -819,7 +992,11 @@ export class Surfaces {
     const channel = await this.#replyChannel(ctx);
     const routed = this.#routeHerdRef(rawForAuth);
     if (routed.foreign) {
-      if (this.deps.config.creOnly || this.deps.config.channelBindings?.[ctx.channel]) return;
+      if (
+        this.deps.config.creOnly ||
+        (/^[CG]/.test(ctx.channel) && this.deps.config.channelBindings?.[ctx.channel])
+      )
+        return;
       const inbound = checkInbound(this.#guards, ctx);
       if (!inbound.allowed) {
         log(`action ${actionId} denied: ${inbound.reason}`);
@@ -837,6 +1014,55 @@ export class Surfaces {
     }
     log(`action ${actionId} terminal=${result.terminalId} actor=${ctx.userId}`);
     await this.#dispatch(actionId, result.terminalId ?? "", value, channel, triggerId, viewId);
+  }
+
+  async #onChannelChrome(
+    ctx: InboundContext,
+    actionId: string,
+    value: string,
+    triggerId: string,
+  ): Promise<void> {
+    const decision = checkInbound(this.#guards, { ...ctx, surface: "mention" });
+    if (!decision.allowed) {
+      this.deps.log(`channel.denied reason=${decision.reason}`);
+      return;
+    }
+    if (!/^[CGD]/.test(ctx.channel)) return;
+    if (actionId === "channel_bind_select") {
+      const decoded = decodeHerdRef(value, this.#localHerdId());
+      const targets = await this.#launchTargets(decoded.herdId);
+      const chosen = targets.workspaces.find((w) => w.id === decoded.ref);
+      if (!chosen) return;
+      if (!this.#herdReachable(decoded.herdId)) {
+        await this.#ephemeral(
+          ctx.channel,
+          "That herd is not reachable right now — wake the machine and start herdr.",
+        );
+        return;
+      }
+      this.deps.config.channelBindings ??= {};
+      this.deps.config.channelBindings[ctx.channel] = value;
+      saveBindings(this.deps.instance, this.deps.config.channelBindings);
+      this.deps.log(`channel.bind channel=${ctx.channel}`);
+      await this.#ephemeral(ctx.channel, `Bound to ${chosen.label}.`);
+      return;
+    }
+    if (value !== ctx.channel) return;
+    const binding = this.deps.config.channelBindings?.[ctx.channel];
+    if (!binding) return;
+    const { herdId, ref } = decodeHerdRef(binding, this.#localHerdId());
+    if (!this.#herdReachable(herdId)) {
+      await this.#ephemeral(
+        ctx.channel,
+        "That herd is not reachable right now — wake the machine and start herdr.",
+      );
+      return;
+    }
+    await this.#openNewAgentModal(triggerId, herdId, {
+      workspaceId: ref,
+      channel: ctx.channel,
+      ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}),
+    });
   }
 
   async #onHomeChrome(
@@ -883,8 +1109,10 @@ export class Surfaces {
 
   /** Fail closed: a herd we cannot find is a herd we will not launch on. */
   #herdReachable(herdId: string): boolean {
+    if (herdId === this.#localHerdId() && this.deps.tail.status !== "connected") return false;
     const herds = this.deps.herd?.homeHerds() ?? [];
-    if (herds.length === 0) return this.deps.tail.status === "connected";
+    if (herds.length === 0)
+      return herdId === this.#localHerdId() && this.deps.tail.status === "connected";
     return herds.find((herd) => herd.herdId === herdId)?.herdrStatus === "connected";
   }
 
@@ -986,12 +1214,16 @@ export class Surfaces {
       await this.#ephemeral(channel, outcome.message ?? "That did not work.");
       return;
     }
-    let latest = this.deps.registry.turns(terminalId).at(-1);
-    if (!latest || latest.status !== "blocked") {
+    let latest =
+      this.deps.registry.activeTurn(terminalId) ?? this.deps.registry.turns(terminalId).at(-1);
+    if (!latest || (latest.status !== "blocked" && latest.status !== "working")) {
       latest = this.deps.registry.startTurn(
         terminalId,
         `Selected option ${decoded.choice}`,
         baseline,
+        undefined,
+        Date.now(),
+        outcome.piBoundary,
       );
     }
     if (latest?.status === "blocked") {
@@ -1074,26 +1306,47 @@ export class Surfaces {
    * the user is still looking at. Redrawing the card is Slack I/O and would eat
    * the submission's time budget, so it happens after this returns.
    */
-  async #submitTurn(terminalId: string, prompt: string): Promise<string | undefined> {
+  async #submitTurn(
+    terminalId: string,
+    prompt: string,
+    origin?: { channel: string; threadTs?: string },
+    expectedWorkspaceId?: string,
+  ): Promise<string | undefined> {
     const record = this.deps.registry.get(terminalId);
     if (!record || record.ended) return "That session has ended — reopen it from the Home tab.";
     if (!isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId))) {
       return "This session is not a verified CRE root.";
     }
-    if (this.#submitting.has(terminalId) || this.deps.registry.activeTurn(terminalId)) {
+    if (
+      this.#submitting.has(terminalId) ||
+      (!origin && this.deps.registry.activeTurn(terminalId))
+    ) {
       return "This agent is still working on your last reply. Wait for it to finish.";
     }
     this.#submitting.add(terminalId);
     try {
+      if (
+        expectedWorkspaceId &&
+        this.deps.state.paneByTerminal(terminalId)?.workspace_id !== expectedWorkspaceId
+      )
+        return "That agent is not in this workspace.";
       const baseline = await this.#sessions.captureBaseline(terminalId);
       if (!isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId))) {
         return "This session is no longer a verified CRE root.";
       }
-      const outcome = await this.#sessions.prompt(terminalId, prompt);
+      if (
+        expectedWorkspaceId &&
+        this.deps.state.paneByTerminal(terminalId)?.workspace_id !== expectedWorkspaceId
+      )
+        return "That agent is not in this workspace.";
+      const outcome = await this.#sessions.prompt(
+        terminalId,
+        prompt,
+        expectedWorkspaceId,
+        origin,
+        baseline,
+      );
       if (!outcome.ok) return outcome.message ?? "The prompt could not be delivered.";
-      const turn = this.deps.registry.startTurn(terminalId, prompt, baseline);
-      if (!turn) return "That session has ended — reopen it from the Home tab.";
-      this.deps.registry.save();
       void this.#sessions.updateCard(terminalId);
       return undefined;
     } finally {
@@ -1101,113 +1354,313 @@ export class Surfaces {
     }
   }
   async #mention(ctx: InboundContext, text: string): Promise<void> {
-    const auth = checkInbound(this.#guards, ctx);
-    if (!auth.allowed || !this.#markMessageSeen(ctx)) return;
-    const { state, config, transport } = this.deps;
-    const workspaceId = config.channelBindings?.[ctx.channel];
-    if (!workspaceId || !state.workspaces.has(workspaceId) || !requireHerdr(this.#guards).allowed)
-      return;
-    const tag = `<@${config.slack.botUserId}>`;
-    const clean = text.trimStart();
-    if (!clean.startsWith(tag)) return;
-    const instruction = clean.slice(tag.length).trim();
-    const cmd = instruction.toLowerCase();
-    const reply = async (msg: string) => {
-      await transport.postMessage({
-        channel: ctx.channel,
-        text: msg,
-        ...(ctx.threadTs || ctx.ts ? { threadTs: ctx.threadTs || ctx.ts } : {}),
-      });
-    };
-    if (ctx.threadTs) {
-      const id = this.terminalForThread(ctx.threadTs, ctx.channel);
-      if (
-        !id ||
-        state.paneByTerminal(id)?.workspace_id !== workspaceId ||
-        !isEligibleCreRoot(config, state.paneByTerminal(id))
-      ) {
-        await reply("Unknown or unverified CRE agent thread.");
-        return;
-      }
-      if (cmd === "stop" || cmd === "end") {
-        await reply("End shared CRE roots directly in Herdr.");
-        return;
-      }
-      const error = await this.#submitTurn(id, instruction);
-      if (error) await reply(error);
+    this.#lastActor = ctx.userId;
+    if (!this.#markMessageSeen(ctx)) return;
+    const decision = checkInbound(this.#guards, ctx);
+    if (!decision.allowed) {
+      this.deps.log(`channel.denied reason=${decision.reason}`);
+      if (decision.reason !== "not_allowed" && decision.reason !== "wrong_team")
+        await this.#ephemeral(ctx.channel, decision.message ?? "Not allowed.");
       return;
     }
-    await this.#mentionCommand(workspaceId, instruction, reply);
+    await this.#handleMention(ctx, parseMention(text, this.deps.config.slack.botUserId));
   }
 
-  async #mentionCommand(
-    workspaceId: string,
-    instruction: string,
-    reply: (message: string) => Promise<void>,
-  ): Promise<void> {
-    const { state, config } = this.deps;
-    const cmd = instruction.toLowerCase();
-    if (["status", "agents", "blocked"].includes(cmd)) {
-      const panes = state
-        .agentPanes()
-        .filter(
-          (p) =>
-            p.workspace_id === workspaceId &&
-            isEligibleCreRoot(config, p) &&
-            (cmd !== "blocked" || p.agent_status === "blocked"),
+  #binding(channel: string): { herdId: string; workspaceId: string } | undefined {
+    const value = this.deps.config.channelBindings?.[channel];
+    if (!value) return undefined;
+    const { herdId, ref } = decodeHerdRef(value, this.#localHerdId());
+    return { herdId, workspaceId: ref };
+  }
+
+  #localAgent(name: string, channel: string): string | undefined {
+    const bound = this.#binding(channel);
+    if (!bound || bound.herdId !== this.#localHerdId()) return undefined;
+    return this.deps.state
+      .agentPanes()
+      .find(
+        (pane) =>
+          pane.workspace_id === bound.workspaceId &&
+          this.deps.state.nameOf(pane.terminal_id) === name,
+      )?.terminal_id;
+  }
+
+  #peerAgent(name: string, channel: string) {
+    const bound = this.#binding(channel);
+    if (!bound || bound.herdId === this.#localHerdId()) return undefined;
+    return this.deps.herd
+      ?.peerAgents(bound.herdId)
+      .find((agent) => agent.name === name && agent.workspaceId === bound.workspaceId && agent.ref);
+  }
+
+  async #promptAt(terminalId: string, text: string, ctx: InboundContext): Promise<void> {
+    const bound = this.#binding(ctx.channel);
+    const pane = this.deps.state.paneByTerminal(terminalId);
+    if (
+      !bound ||
+      bound.herdId !== this.#localHerdId() ||
+      !pane ||
+      pane.workspace_id !== bound.workspaceId
+    ) {
+      await this.#ephemeral(ctx.channel, "That agent is not in this workspace.");
+      return;
+    }
+    const herdr = requireHerdr(this.#guards);
+    if (!herdr.allowed) {
+      await this.#ephemeral(ctx.channel, herdr.message ?? "herdr is not connected.");
+      return;
+    }
+    const origin = { channel: ctx.channel, ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}) };
+    const error = await this.#submitTurn(terminalId, text, origin, bound.workspaceId);
+    if (error) await this.#ephemeral(ctx.channel, error);
+    else
+      this.deps.log(
+        `channel.prompt terminal=${terminalId} origin=${ctx.channel}:${ctx.threadTs ?? ""}`,
+      );
+  }
+
+  async #handleMention(ctx: InboundContext, command: MentionCommand): Promise<void> {
+    const { config, state, transport, herd } = this.deps;
+    const reply = async (text: string) =>
+      transport.postMessage({
+        channel: ctx.channel,
+        text,
+        ...(ctx.threadTs || ctx.ts ? { threadTs: ctx.threadTs || ctx.ts } : {}),
+      });
+    if (command.kind === "help") {
+      await reply(
+        "Use @herdr bind, unbind, agents, new, help, or @herdr <name> <text> | context <text> | stop | clear.",
+      );
+      return;
+    }
+    if (command.kind === "bind") {
+      if (!/^[CGD]/.test(ctx.channel)) {
+        await this.#ephemeral(ctx.channel, "Bind works only in channels and bot DMs.");
+        return;
+      }
+      const local = this.#localHerdId();
+      const herds = herd?.homeHerds() ?? [{ herdId: local, label: config.label }];
+      const options = (
+        await Promise.all(
+          herds.map(async (entry) => {
+            const targets =
+              entry.herdId === local && !herd
+                ? {
+                    workspaces: [...state.workspaces.values()].map((w) => ({
+                      id: w.workspace_id,
+                      label: w.label || w.workspace_id,
+                    })),
+                  }
+                : await this.#launchTargets(entry.herdId);
+            return targets.workspaces.map((w) => ({
+              label: `${entry.label} / ${w.label}`,
+              value: encodeHerdRef(entry.herdId, w.id, local),
+            }));
+          }),
+        )
+      ).flat();
+      if (!options.length) {
+        await this.#ephemeral(ctx.channel, "No workspaces reported yet.");
+        return;
+      }
+      await this.#ephemeral(ctx.channel, "Choose a workspace to bind.", {
+        userId: ctx.userId,
+        threadTs: ctx.threadTs,
+        blocks: [
+          {
+            type: "actions",
+            elements: [
+              {
+                type: "static_select",
+                action_id: "channel_bind_select",
+                placeholder: { type: "plain_text", text: "Workspace" },
+                options: capOptions(options).map(option),
+              },
+            ],
+          },
+        ],
+      });
+      return;
+    }
+    if (command.kind === "unbind") {
+      delete config.channelBindings?.[ctx.channel];
+      saveBindings(this.deps.instance, config.channelBindings ?? {});
+      this.deps.log(`channel.unbind channel=${ctx.channel}`);
+      await this.#ephemeral(ctx.channel, "Channel unbound.");
+      return;
+    }
+    const bound = this.#binding(ctx.channel);
+    if (!bound) {
+      await this.#ephemeral(ctx.channel, "This channel is not bound to a herdr workspace.");
+      this.deps.log("channel.denied reason=channel_not_permitted");
+      return;
+    }
+    if (bound.herdId === this.#localHerdId()) {
+      const herdr = requireHerdr(this.#guards);
+      if (!herdr.allowed) {
+        await this.#ephemeral(ctx.channel, herdr.message ?? "herdr is not connected.");
+        return;
+      }
+    } else if (!this.#herdReachable(bound.herdId)) {
+      await this.#ephemeral(
+        ctx.channel,
+        "That herd is not reachable right now — wake the machine and start herdr.",
+      );
+      return;
+    }
+    if (command.kind === "agents") {
+      const localRows =
+        bound.herdId === this.#localHerdId()
+          ? state
+              .agentPanes()
+              .filter((p) => p.workspace_id === bound.workspaceId && state.nameOf(p.terminal_id))
+              .map(
+                (p) =>
+                  `${state.nameOf(p.terminal_id)} · ${p.agent} · ${state.statusOf(p.terminal_id) ?? p.agent_status}`,
+              )
+          : [];
+      const peerRows =
+        bound.herdId === this.#localHerdId()
+          ? []
+          : (herd?.peerAgents(bound.herdId) ?? [])
+              .filter((agent) => agent.workspaceId === bound.workspaceId && agent.name)
+              .map((agent) => `${agent.name} · ${agent.agent} · ${agent.status}`);
+      await reply(
+        [...localRows, ...peerRows].slice(0, 20).join("\n") || "No agents in this workspace.",
+      );
+      return;
+    }
+    if (command.kind === "new") {
+      await this.#ephemeral(ctx.channel, "Start an agent in this workspace.", {
+        userId: ctx.userId,
+        threadTs: ctx.threadTs,
+        blocks: [
+          {
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                text: { type: "plain_text", text: "New agent" },
+                action_id: "channel_new_agent",
+                value: ctx.channel,
+              },
+            ],
+          },
+        ],
+      });
+      return;
+    }
+    if (command.kind !== "agent") {
+      await this.#ephemeral(ctx.channel, "Unknown command; try @herdr help.");
+      return;
+    }
+    const peer = this.#peerAgent(command.name, ctx.channel);
+    const id =
+      bound.herdId === this.#localHerdId()
+        ? this.#localAgent(command.name, ctx.channel)
+        : undefined;
+    if (!id && !peer) {
+      await this.#ephemeral(ctx.channel, `No agent called *${command.name}* here.`);
+      return;
+    }
+    if (peer && (command.verb === "stop" || command.verb === "clear")) {
+      herd?.forwardCommand({
+        op: command.verb,
+        herdId: bound.herdId,
+        ref: peer.ref,
+        expectedWorkspaceId: bound.workspaceId,
+        channel: ctx.channel,
+        userId: ctx.userId,
+      });
+      await this.#ephemeral(
+        ctx.channel,
+        command.verb === "stop" ? "Sent interrupt." : "Sent clear.",
+      );
+      return;
+    }
+    if (id && (command.verb === "stop" || command.verb === "clear")) {
+      const outcome =
+        command.verb === "stop"
+          ? await this.#sessions.interrupt(id, bound.workspaceId)
+          : await this.#sessions.clear(id, bound.workspaceId);
+      await this.#ephemeral(
+        ctx.channel,
+        outcome.ok
+          ? command.verb === "stop"
+            ? "Sent interrupt."
+            : "Cleared context."
+          : (outcome.message ?? "That did not work."),
+      );
+      return;
+    }
+    let prompt = command.text;
+    if (command.verb === "context") {
+      try {
+        const history = await transport.history(ctx.channel, {
+          limit: config.contextMessages ?? 50,
+        });
+        const kept = history
+          .filter(
+            (m) =>
+              !m.botId &&
+              !m.subtype &&
+              m.user &&
+              config.allowedUsers.includes(m.user) &&
+              m.ts !== ctx.ts,
+          )
+          .sort((a, b) => Number(a.ts) - Number(b.ts));
+        // Names are display text for the agent only; authorization stays on m.user.
+        const ids = new Set<string>();
+        for (const m of kept) {
+          ids.add(m.user ?? "");
+          mapMentions(m.text, (token, id) => {
+            ids.add(id);
+            return token;
+          });
+        }
+        const names = new Map(
+          await Promise.all(
+            [...ids].map(async (id) => {
+              const name = await transport.userName(id).catch(() => undefined);
+              return [id, name && SLACK_USERNAME.test(name) ? `@${name}` : undefined] as const;
+            }),
+          ),
         );
-      await reply(
-        [
-          `${panes.length} agents in workspace ${workspaceId}`,
-          ...panes
-            .slice(0, 20)
-            .map(
-              (p) =>
-                `${p.agent ?? "agent"}: ${p.agent_status} — ${p.terminal_title_stripped ?? "untitled"}`,
-            ),
-        ].join("\\n"),
+        const lines = kept.map((m) => {
+          const body = mapMentions(m.text, (token, id) => names.get(id) ?? token);
+          return redact(`${names.get(m.user ?? "") ?? `<@${m.user}>`}: ${body}`).text;
+        });
+        if (lines.length)
+          prompt = `Recent Slack messages:\n${lines.join("\n")}\n\nRequest:\n${prompt}`;
+      } catch (error) {
+        await this.#ephemeral(
+          ctx.channel,
+          describe(error) === "not_in_channel"
+            ? "Invite @herdr to this channel so it can read messages."
+            : "Could not read recent messages.",
+        );
+        return;
+      }
+    }
+    if (peer) {
+      herd?.forwardCommand({
+        op: "prompt",
+        herdId: bound.herdId,
+        ref: peer.ref,
+        expectedWorkspaceId: bound.workspaceId,
+        channel: ctx.channel,
+        ...(ctx.threadTs ? { threadTs: ctx.threadTs } : {}),
+        userId: ctx.userId,
+        text: prompt,
+      });
+      this.deps.log(
+        `channel.prompt herd=${bound.herdId} origin=${ctx.channel}:${ctx.threadTs ?? ""}`,
       );
-      return;
-    }
-    if (cmd === "help" || !cmd) {
-      await reply(
-        "Use @herdr status, @herdr blocked, @herdr start codex | task, or mention me in an agent thread.",
-      );
-      return;
-    }
-    if (config.creOnly) {
-      await reply("CRE-only attach mode: start CRE manually in Herdr and pin its session.");
-      return;
-    }
-    const found = /^(?:start|new)\s+([a-z][a-z0-9_-]*)\s*\|\s*([\s\S]+)$/i.exec(instruction);
-    if (!found) {
-      await reply("Unknown command; try @herdr help.");
-      return;
-    }
-    const kind = found[1] ?? "";
-    const firstPrompt = found[2]?.trim() ?? "";
-    const entry = findEntry(loadCatalog(), kind);
-    if (!entry || !firstPrompt) {
-      await reply("Invalid agent kind or empty prompt.");
-      return;
-    }
-    const result = await launchAgent(this.deps.client, {
-      workspaceId,
-      kind,
-      mode: autoModeFor(entry),
-      name: sanitizeAgentName(`${kind}-${Date.now().toString(36)}`),
-      label: `Slack ${kind}`,
-      firstPrompt,
-    });
-    await reply(
-      result.ok
-        ? `Started ${kind} in bound workspace.`
-        : `Launch failed: ${result.message ?? "unknown"}`,
-    );
-    this.#scheduleChannel();
+    } else if (id) await this.#promptAt(id, prompt, ctx);
   }
 
   #scheduleChannel(): void {
+    if (!this.deps.config.creOnly) return;
     if (this.#channelTimer || !Object.keys(this.deps.config.channelBindings ?? {}).length) return;
     this.#channelTimer = setTimeout(() => {
       this.#channelTimer = null;
@@ -1396,6 +1849,7 @@ export class Surfaces {
         user: userId,
         text,
         ...(to?.threadTs ? { threadTs: to.threadTs } : {}),
+        ...(to?.blocks ? { blocks: to.blocks } : {}),
       })
       .catch(() => undefined);
   }

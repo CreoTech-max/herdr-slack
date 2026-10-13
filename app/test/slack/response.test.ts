@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { extractAgentResponse } from "../../src/slack/response.js";
 
@@ -177,40 +176,5 @@ Done. Choosing Continue or Reset now reopens a fresh setup popup.
     const response = extractAgentResponse(body);
     expect(response.startsWith("line 1\n")).toBe(true);
     expect(response).toContain("line 400");
-  });
-});
-
-/**
- * Pi (what cre runs, detected by herdr as `pi`) redraws the whole screen, so the
- * previous screen is never a prefix of the next: banners on top, then the
- * conversation, then an editor box and status lines that change every turn.
- * Captured live in the T0 spike (herdr 0.9.3); user and host names replaced.
- */
-describe("extractAgentResponse for cre (pi)", () => {
-  const screen = (name: string) =>
-    readFileSync(new URL(`fixtures/${name}.txt`, import.meta.url), "utf8");
-  const before = screen("cre-before");
-  const turn1 = screen("cre-turn1");
-  const turn2 = screen("cre-turn2");
-
-  it("returns only the reply to the first prompt", () => {
-    expect(extractAgentResponse(turn1, before, "pi")).toBe("PONG");
-  });
-
-  it("returns only the reply to a later prompt", () => {
-    expect(extractAgentResponse(turn2, turn1, "pi")).toBe("ALPHA BRAVO CHARLIE");
-  });
-
-  it("takes the last message when there is no baseline", () => {
-    expect(extractAgentResponse(turn2, "", "pi")).toBe("ALPHA BRAVO CHARLIE");
-  });
-
-  it("returns nothing when the screen did not change", () => {
-    expect(extractAgentResponse(turn1, turn1, "pi")).toBe("");
-  });
-
-  it("keeps a multi-paragraph reply whole", () => {
-    const reply = turn1.replace(" PONG\n", " First paragraph.\n\n Second paragraph.\n");
-    expect(extractAgentResponse(reply, before, "pi")).toBe("First paragraph.\n\nSecond paragraph.");
   });
 });

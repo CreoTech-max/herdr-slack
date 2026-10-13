@@ -3,6 +3,28 @@
 Status: revised after simplicity + feasibility review (see "Review log" at the end).
 Scope: the approved concept core only. Nothing in "Out of scope" is built.
 
+**Structured Pi reply update (supersedes T0 step 5 and T5 step 4 for cre replies):**
+Pi/cre replies come from the local herdr pane's `agent_session` path, not its rendered terminal.
+The daemon accepts only verified session files under the installed cre profile's default
+`~/.pi/cre/sessions`, or an explicitly inherited `PI_CODING_AGENT_SESSION_DIR`.
+It validates file identity and a persisted pre-send turn boundary, selects a complete assistant
+text response from the current branch, and redacts it before storage or Slack.
+Prompt turns remain pending until herdr acknowledges delivery; a blocked tool-use turn remains
+active through approval. Reconnect snapshots retry verified, settled pending turns without a
+new status edge. Both native Pi and cre first prompts capture their boundary before delivery.
+Hard-linked session files fail closed. The boundary persists verified directory and file identity;
+if the file did not exist at capture, its first verified creation binds that identity once. Normal
+append does not change this identity. A changed or missing source cannot announce after a card
+update. An unacknowledged or invalidated prompt leaves its saved turn pending across restart;
+only another explicit confirmed prompt can replace that uncertain delivery.
+Missing, stale, unsupported or invalid sessions fail closed without exposing their content. The file's last
+append cannot identify a read-only `/tree` leaf change, so a navigation without a new message
+cannot create a new reply. A session tail without complete branch evidence fails closed.
+The earlier Pi terminal fixture tests remain historical T0 evidence, not the live extraction path.
+Non-Pi terminal extraction, TUI control and signed satellite routing remain unchanged.
+These portable checks trust processes under the same OS account. They do not give atomic path
+containment against an actively hostile same-account writer, or a herdr-to-Slack transaction.
+
 ## 0. Decisions already taken by this plan
 
 | # | Decision | Why |
@@ -30,9 +52,9 @@ Steps (each with its check):
 5. `pane.read {source:"recent_unwrapped", strip_ansi:true, lines:120}` before and after → feed both into `extractAgentResponse(after, before)` in a vitest fixture → the result is the assistant reply, not TUI chrome. The T0 fixture failed; T5 adds minimal cre-specific extraction with `t0-fixtures/turn1.txt` and `turn2.txt`.
 6. Confirm `agent.send_keys {keys:["esc"]}` interrupts a working cre turn. Confirm the working clear command and delivery method; T6 step 8 uses `agent.prompt "/new"` and restores the previous name with `agent.rename`.
 7. Deferred to the user's live test: observe whether `app_mention` fires in the bot DM (B2 means this is not load-bearing).
-8. Deferred to the user's live test: smoke-test `conversations.replies` on a private channel thread with the bot as a member.
+8. Bot access to private-channel `conversations.replies` was inferred, not verified. Channel context now uses `conversations.history`; a thread-replies smoke check is not required.
 
-**Done:** "Spike results" records typing method + params, snapshot name, rename, interrupt and clear delivery. The response fixture and extraction fix move to T5; steps 7–8 move to the user's live test.
+**Done:** "Spike results" records typing method + params, snapshot name, rename, interrupt and clear delivery. The response fixture and extraction fix move to T5; step 7 moves to the user's live test; step 8 is not required.
 
 ## 2. Tasks
 
@@ -59,10 +81,10 @@ Each task: goal · files · steps · tests · done check. Tests mirror `app/test
 **Done:** `npx vitest run app/test/slack/guards.test.ts app/test/slack/channel-bindings.test.ts app/test/registry/bindings.test.ts app/test/config/config.test.ts` → pass; coverage for `guards.ts` 100% in `npm run check`.
 
 ### T3 — Slack history read + manifest
-**Goal:** the daemon can read recent channel/thread messages; the manifest asks for the scopes and events.
+**Goal:** the daemon can read recent channel or DM messages; the manifest asks for the scopes and events.
 **Files:** `app/src/slack/transport.ts` (interface, after `openModal` at transport.ts:46; `EphemeralInput` at transport.ts:62-67; `parseActionPayload` at transport.ts:228-241), `app/src/slack/socket-transport.ts`, `app/src/slack/web-api-transport.ts`, `app/src/slack/dry-run-transport.ts`, `app/test/helpers/fake-transport.ts`, `app/src/slack/manifest.ts:9-24, 139-146`, `app/test/slack/manifest.test.ts`, `app/test/slack/action-payload.test.ts`.
 **Steps:**
-1. `SlackTransport.history(channel, opts: { threadTs?: string; limit: number }): Promise<HistoryMessage[]>` where `HistoryMessage = { user?: string; text: string; ts: string; botId?: string; subtype?: string }`. Socket/WebApi: `conversations.replies` when `threadTs` else `conversations.history`, one call, `limit` as given (≤ 999), map fields with the `str` guard. A Slack `not_in_channel` error is thrown as `Error("not_in_channel")`. Dry-run returns `[]`. Fake gets `historyMessages: HistoryMessage[] = []` and `historyError?: string`; its `history()` throws `Error(historyError)` when set, else returns the messages.
+1. `SlackTransport.history(channel, opts: { threadTs?: string; limit: number }): Promise<HistoryMessage[]>` where `HistoryMessage = { user?: string; text: string; ts: string; botId?: string; subtype?: string }`. Socket/WebApi: `conversations.history` for channels and DMs, including prompts inside threads; one call, `limit` as given (≤ 999), map fields with the `str` guard. A Slack `not_in_channel` error is thrown as `Error("not_in_channel")`. Dry-run returns `[]`. Fake gets `historyMessages: HistoryMessage[] = []` and `historyError?: string`; its `history()` throws `Error(historyError)` when set, else returns the messages.
 1a. `EphemeralInput.blocks?: unknown[]` (F1). Socket (socket-transport.ts:273) and WebApi (web-api-transport.ts:91) pass `blocks` when present; dry-run records them; fake `ephemerals` entries keep them.
 1b. `parseActionPayload` (F2): `value = str(action.value) || str(action.selected_option?.value)` via `asRecord`, so a `static_select` click yields the chosen option.
 2. `manifest.ts`: add scopes `channels:history`, `groups:history`; events `message.channels`, `message.groups`; `SCOPE_REASON` entries. Update `manifest.test.ts` expectations.
@@ -104,7 +126,7 @@ Each task: goal · files · steps · tests · done check. Tests mirror `app/test
 4. **help:** one message listing the commands.
 5. **new:** ephemeral with button `channel_new_agent` (value = channel). Click → `#herdReachable(herdId)` (surfaces.ts:884) else the Home ephemeral "That herd is not reachable right now…" and no modal → `#openNewAgentModal(triggerId, herdId, { workspaceId, channel, threadTs })`; `buildNewAgentModal` renders the locked workspace as a context line, omits the workspace select, defaults `kind` to `cre`, and writes `private_metadata = JSON.stringify({herdId, workspaceId?, channel?, threadTs?})`. Home's `＋ New agent` writes `JSON.stringify({herdId})`. `parseNewAgentSubmission` parses JSON only; a non-JSON or empty string → `herdId` absent (no bare-string fallback). On submit (`#launchFromModal`): when metadata has `channel`, use it (not `#replyChannel`, which picks the DM, surfaces.ts:398) for the outcome ephemerals and as origin `{channel, threadTs}`; force `workspaceId` from metadata when present; after `launchAgent` ok: `await tail.reconcile(); reconcileSessions();` then `terminalId = state.terminalByPane.get(result.paneId)`; if a first prompt was delivered → `startTurn(terminalId, firstPrompt, "", origin)` so the first reply lands in the channel. Foreign herd → existing `#forwardLaunch` with the origin `channel` and `threadTs` in the command (T7 satellite does the same turn start).
 6. **prompt:** `#submitTurn(terminalId, text, origin?)` — with `origin` set: skip the busy refusal; if `activeTurn` exists → `updateTurn(id, {origin})` (steer) else `startTurn(..., origin)`; send via `sessions.prompt`. Foreign → `herd.forwardCommand({op:"prompt", herdId, ref, text, channel, threadTs})`. Origin = `{channel: ctx.channel, threadTs: ctx.threadTs}`.
-7. **context:** `transport.history(ctx.channel, {threadTs: ctx.threadTs, limit: config.contextMessages})` → keep messages where `!botId && !subtype && user && allowedUsers.includes(user) && ts !== ctx.ts` → oldest first → `redact(text).text` each → `"Recent Slack messages:\n<@U>: …\n…\n\nRequest:\n<text>"` → same path as prompt. Empty history → plain prompt. `history` throws `not_in_channel` → ephemeral "Invite @herdr to this channel so it can read messages." and no prompt.
+7. **context:** `transport.history(ctx.channel, {limit: config.contextMessages})` → keep messages where `!botId && !subtype && user && allowedUsers.includes(user) && ts !== ctx.ts` → oldest first → authors and `<@U>` mentions outside code shown as `@username` (`users.info`, ID fallback) → `redact(line).text` each → `"Recent Slack messages:\n@name: …\n…\n\nRequest:\n<text>"` → same path as prompt. Empty history → plain prompt. `history` throws `not_in_channel` → ephemeral "Invite @herdr to this channel so it can read messages." and no prompt.
 8. **stop:** `sessions.interrupt(terminalId)` → `client.sendKeys(pane, INTERRUPT_KEYS)`; no turn change; ephemeral "Sent interrupt." **clear:** `sessions.clear(terminalId)` → `agent.prompt "/new"`, then `agent.rename` with the previous name (because `/new` removes it); no turn. Foreign → ops `stop` / `clear` (T7).
 9. **onMessage** (surfaces.ts:155-182): (a) first, before any `checkInbound`: if `text.trimStart()` starts with `<@BOT>` → `#mention({ ...ctx, surface: "mention" }, text)` and return, in every channel type. `#mention` dedupes on `channel:ts` before its one `checkInbound` (step 1), and `app_mention` and `message.*` share the `ts`, so the first event is handled and the other is dropped at no throttle cost (B2, R1). Else `checkInbound` as today. (b) `#markMessageSeen`; if `ctx.threadTs` and `registry.terminalForReplyPost(ctx.channel, ctx.threadTs)` → local prompt with origin `{channel, threadTs}` through step 1's herdr/live/workspace checks; else if a peer snapshot's `replyPosts` contains `{channel, threadTs}` → forward `prompt` to that herd (T7). (c) else if channel is a DM → `parseMention(text)`; `unknown` → existing `#handleBareMessage`; an `agent` result whose name has no agent in the DM's bound workspace (or an unbound DM) → `#handleBareMessage` (R6); any other result → the step-1 command handler (so `help` and `bind` work). (d) else return silently. Remove the two "Use *Reply* on the session card" ephemerals.
 10. `#scheduleChannel` (surfaces.ts:1209): first line `if (!this.deps.config.creOnly) return;` so `#syncChannel`/`#syncBoundPanes`/`#retireMovedThread`/`#detachInvalidThreads` run only for the old attach mode (B3). Drop the `#scheduleChannel()` call from the old `#mentionCommand` with the rewrite.
@@ -131,7 +153,7 @@ Each task: goal · files · steps · tests · done check. Tests mirror `app/test
 
 ### T9 — integration gate
 1. `npm run check` → exit 0, coverage ≥ 80%, `guards.ts` 100%.
-2. Live QA (manual, needs the re-installed Slack app and herdr): observe whether `app_mention` fires in the bot DM; call `conversations.replies` on a private channel thread. In a private channel: `@herdr bind` → pick → `@herdr new` → start cre with a first prompt → reply appears in channel → thread-reply on it → agent continues → `@herdr <name> context summarise` → `@herdr <name> stop` → `@herdr <name> clear` → `@herdr agents` → `@herdr unbind`. In the bot DM: `help` and `@herdr help` answer; `what needs my attention` still gives the herd summary; `@herdr bind` → pick → `@herdr new` → start an agent with a first prompt → reply appears in DM → `@herdr <name> hi` → reply appears in DM → `@herdr unbind`; a card button for an agent in another workspace still works. Record pass/fail per step in the task result.
+2. Live QA (manual, needs the re-installed Slack app and herdr): observe whether `app_mention` fires in the bot DM. In a private channel: `@herdr bind` → pick → `@herdr new` → start cre with a first prompt → reply appears in channel → thread-reply on it → agent continues → `@herdr <name> context summarise` → `@herdr <name> stop` → `@herdr <name> clear` → `@herdr agents` → `@herdr unbind`. In the bot DM: `help` and `@herdr help` answer; `what needs my attention` still gives the herd summary; `@herdr bind` → pick → `@herdr new` → start an agent with a first prompt → reply appears in DM → `@herdr <name> hi` → reply appears in DM → `@herdr unbind`; a card button for an agent in another workspace still works. Record pass/fail per step in the task result.
 
 ## 3. Dependency graph
 
@@ -196,7 +218,7 @@ T0, T1, T2, T3, T4 run in parallel (disjoint files, no shared interface until T6
 - `agent.send_keys {target, keys:["esc"]}` interrupted a working turn. `agent.prompt "/clear"` became a normal prompt; Pi has no `/clear`. `agent.prompt "/new"` started a new session but cleared the herdr name; T6 re-runs `agent.rename`. See T0 step 6.
 - `extractAgentResponse` returned the whole Pi screen for both turns: `response.ts:20-31` cannot match redraws. T5 adds cre-specific extraction with `.git/cre/t0-fixtures/turn1.txt` and `turn2.txt` and a test fixture. See T0 step 5.
 - Cre working/done events arrived only through per-pane `pane.agent_status_changed`, not global `pane.updated` (`types.ts:192-207`). T4 subscribes to per-pane agent events to settle without the 30 s reconcile. See T0 step 4.
-- T0 steps 7–8 (`app_mention` in a bot DM; `conversations.replies` in a private channel) remain deferred to the user's live test. No Slack token was used for these checks.
+- T0 step 7 (`app_mention` in a bot DM) remains deferred to the user's live test. Bot access to private-channel `conversations.replies` was inferred, not verified; channel context now uses `conversations.history`. No Slack token was used for these checks.
 
 ## Review log
 
@@ -228,10 +250,10 @@ T0, T1, T2, T3, T4 run in parallel (disjoint files, no shared interface until T6
 | R5 | D1/T2 steps 1-2: `bindings.json` authoritative, seeded once from config. No tombstones. Restart test. |
 | R6 | T1 test corrected (bare phrase parses as an agent command); T6 step 9(c) falls back to `#handleBareMessage` when the name has no agent in the bound workspace. Both tested. |
 | R7 | T6 step 5: click reuses `#herdReachable` (surfaces.ts:884); offline local and foreign tested. |
-| R8 | Settled (round 3): a bot token with `channels:history`/`groups:history`/`im:history` is enough for `conversations.history` and `conversations.replies` in conversations the bot is a member of; otherwise `not_in_channel` (https://docs.slack.dev/reference/methods/conversations.history, https://docs.slack.dev/messaging/retrieving-messages#pulling_threads). Internal custom apps are exempt from the 2025 non-Marketplace rate limit (https://docs.slack.dev/changelog/2025/05/29/rate-limit-changes-for-non-marketplace-apps). No user token. T0 step 9 removed; step 8 kept as the one live smoke check. |
+| R8 | `conversations.history` supports bot tokens in channels the bot belongs to (https://docs.slack.dev/reference/methods/conversations.history); `not_in_channel` refuses context otherwise. Bot access to private-channel thread `conversations.replies` was inferred, NOT verified. Context always reads channel or DM history, including prompts inside threads; reply origin still keeps `threadTs`. No user token or login is required for this path. Internal custom apps are exempt from the 2025 non-Marketplace history limit (https://docs.slack.dev/changelog/2025/05/29/rate-limit-changes-for-non-marketplace-apps). |
 | R9 | T3: fake field is `historyMessages`. |
 | F1 (r3) | T3 step 1a: optional `blocks` on `EphemeralInput` in all four transports; T6 tests assert the select and button blocks. |
 | F2 (r3) | T3 step 1b: `parseActionPayload` reads `selected_option.value`; real `static_select` payload test. |
 | F3 (r3) | T7 step 2: satellite `#runLaunch` (herd-bridge.ts:444) origin keeps `command.threadTs`; thread-launch test. |
-| F4 (r3) | R8 settled by docs; T0 step 9 removed; `not_in_channel` → refusal ephemeral, no prompt (T3 step 1, T6 step 7), tested. |
-| T0 resolved | Step 6 found no `/clear`; `/new` works through `agent.prompt` and clears the herdr name. Steps 7–8 are deferred to the user's live test. |
+| F4 (r3) | History bot support is documented; thread-replies bot access was not verified. `not_in_channel` → refusal ephemeral, no prompt (T3 step 1, T6 step 7), tested. |
+| T0 resolved | Step 6 found no `/clear`; `/new` works through `agent.prompt` and clears the herdr name. Step 7 is deferred to the user's live test; thread-replies bot access remains unverified and is not used for context. |

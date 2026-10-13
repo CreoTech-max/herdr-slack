@@ -43,6 +43,16 @@ export class FakeTransport implements SlackTransport {
     if (this.historyError) throw new Error(this.historyError);
     return this.historyMessages;
   }
+  /** Slack `user.name` per member id; an Error value makes that lookup reject. */
+  readonly userNames = new Map<string, string | Error>();
+  readonly userLookups: string[] = [];
+
+  async userName(userId: string): Promise<string | undefined> {
+    this.userLookups.push(userId);
+    const name = this.userNames.get(userId);
+    if (name instanceof Error) throw name;
+    return name;
+  }
   readonly titles: { channel: string; threadTs: string; title: string }[] = [];
   readonly modals: { triggerId: string; view: Record<string, unknown> }[] = [];
   readonly modalUpdates: { viewId: string; view: Record<string, unknown> }[] = [];

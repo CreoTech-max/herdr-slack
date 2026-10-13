@@ -209,6 +209,36 @@ describe("SessionState", () => {
   });
 
   describe("snapshot reconcile", () => {
+    it("tracks a Pi session change in pane events and subsequent snapshots", () => {
+      const prior = pane({
+        agent: "pi",
+        agent_session: { agent: "pi", kind: "path", source: "herdr:pi", value: "/local/old.jsonl" },
+      });
+      const session = prior.agent_session;
+      if (!session) throw new Error("Pi session missing");
+      state.apply({ type: "pane_created", pane: prior });
+      state.apply({
+        type: "pane_updated",
+        pane: { ...prior, agent_session: { ...session, value: "/local/new.jsonl" } },
+      });
+      expect(state.paneByTerminal(prior.terminal_id)?.agent_session?.value).toBe(
+        "/local/new.jsonl",
+      );
+      state.applySnapshot(
+        snapshot({
+          panes: [
+            {
+              ...prior,
+              agent_session: { ...session, value: "/local/reconnected.jsonl" },
+            },
+          ],
+        }),
+      );
+      expect(state.paneByTerminal(prior.terminal_id)?.agent_session?.value).toBe(
+        "/local/reconnected.jsonl",
+      );
+    });
+
     it("adopts the snapshot and drops terminals it no longer lists", () => {
       const stale = pane({ terminal_id: "term_stale" });
       const live = pane({ terminal_id: "term_live" });

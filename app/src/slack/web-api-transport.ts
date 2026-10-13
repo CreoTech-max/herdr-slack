@@ -67,14 +67,10 @@ export class WebApiTransport implements SlackTransport {
     opts: { threadTs?: string; limit: number },
   ): Promise<HistoryMessage[]> {
     try {
-      const result = await this.#call(
-        opts.threadTs ? "conversations.replies" : "conversations.history",
-        {
-          channel,
-          limit: opts.limit,
-          ...(opts.threadTs ? { ts: opts.threadTs } : {}),
-        },
-      );
+      const result = await this.#call("conversations.history", {
+        channel,
+        limit: opts.limit,
+      });
       return Array.isArray(result.messages)
         ? result.messages.map((item: unknown) => {
             const message =
@@ -93,6 +89,13 @@ export class WebApiTransport implements SlackTransport {
         throw new Error("not_in_channel");
       throw error;
     }
+  }
+
+  async userName(userId: string): Promise<string | undefined> {
+    const user = (await this.#call("users.info", { user: userId })).user;
+    if (!user || typeof user !== "object") return undefined;
+    const record = user as Record<string, unknown>;
+    return record.deleted === true ? undefined : str(record.name) || undefined;
   }
 
   async updateMessage(input: UpdateInput): Promise<void> {

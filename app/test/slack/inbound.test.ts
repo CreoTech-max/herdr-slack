@@ -79,6 +79,15 @@ describe("contextFromPayload", () => {
     });
   });
 
+  it("reads message.thread_ts when the button container lacks it", () => {
+    const payload = {
+      ...messageButton,
+      container: { type: "message", channel_id: "C1", message_ts: "111.2" },
+      message: { thread_ts: "111.0" },
+    };
+    expect(contextFromPayload(payload).threadTs).toBe("111.0");
+  });
+
   it("falls back to the configured team when the payload omits one", () => {
     const ctx = contextFromPayload({ type: "block_actions", user: { id: "U1" } }, "T_CONFIG");
     expect(ctx.teamId).toBe("T_CONFIG");

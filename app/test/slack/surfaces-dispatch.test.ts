@@ -351,7 +351,7 @@ describe("Surfaces action dispatch", () => {
     expect(said(transport)).toContain("session has ended");
   });
 
-  it("does not treat thread messages as prompts", async () => {
+  it("does not treat card-thread messages as prompts", async () => {
     fake.on("agent.prompt", () => ({ ok: true }));
     await transport.emitAction({
       ctx: ctx(),
@@ -364,7 +364,7 @@ describe("Surfaces action dispatch", () => {
     await transport.emitMessage({ ctx: ctx({ threadTs, ts: "100.001" }), text: "keep going" });
 
     expect(fake.requests.some((r) => r.method === "agent.prompt")).toBe(false);
-    expect(said(transport)).toContain("Use *Reply*");
+    expect(transport.ephemerals).toHaveLength(0);
   });
 
   it("refuses session controls when herdr disconnects", async () => {
@@ -408,12 +408,12 @@ describe("Surfaces action dispatch", () => {
     expect(transport.ephemerals).toHaveLength(before);
   });
 
-  it("rejects a reply in an unknown thread", async () => {
+  it("ignores a reply in an unknown thread", async () => {
     await transport.emitMessage({
       ctx: ctx({ threadTs: "unknown", ts: "100.002" }),
       text: "hello",
     });
-    expect(said(transport)).toContain("do not recognise this thread");
+    expect(transport.ephemerals).toHaveLength(0);
   });
 
   it("never guesses a target for a bare DM", async () => {
@@ -436,7 +436,7 @@ describe("Surfaces action dispatch", () => {
     await transport.emitMessage({ ctx: ctx({ threadTs: "999.999" }), text: "hello" });
 
     expect(fake.requests.some((r) => r.method === "agent.prompt")).toBe(false);
-    expect(said(transport)).toContain("do not recognise");
+    expect(transport.ephemerals).toHaveLength(0);
   });
 
   it("ignores a message from someone not on the allowlist", async () => {

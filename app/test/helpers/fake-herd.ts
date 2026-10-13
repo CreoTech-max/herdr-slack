@@ -1,4 +1,4 @@
-import type { HerdLaunchOptions } from "../../src/daemon/herd-registry.js";
+import type { HerdAgentSnapshot, HerdLaunchOptions } from "../../src/daemon/herd-registry.js";
 import type { HerdPort } from "../../src/slack/herd-port.js";
 import type { HomeAgent, HomeHerd } from "../../src/slack/home.js";
 import type { SessionController } from "../../src/slack/session-controller.js";
@@ -8,6 +8,8 @@ export interface ForwardedCommand {
   herdId: string;
   ref: string;
   channel: string;
+  threadTs?: string;
+  expectedWorkspaceId?: string;
   userId: string;
   text?: string;
   launch?: Record<string, unknown>;
@@ -45,6 +47,7 @@ export class FakeHerd implements HerdPort {
     private herds: HomeHerd[] = [herd()],
     private foreignAgents: HomeAgent[] = [],
     private launch: Record<string, HerdLaunchOptions> = {},
+    private snapshots: Record<string, HerdAgentSnapshot[]> = {},
   ) {}
 
   static withPeer(peerId = "host:them:default"): FakeHerd {
@@ -82,6 +85,9 @@ export class FakeHerd implements HerdPort {
         [peerId]: {
           workspaces: [{ id: "w9", label: "their workspace" }],
           worktrees: [{ label: "their-tree", path: "/them/tree", branch: "main" }],
+          worktreesByWorkspace: {
+            w9: [{ label: "their-tree", path: "/them/tree", branch: "main" }],
+          },
           kinds: [{ kind: "claude", label: "Claude Code" }],
         },
       },
@@ -100,6 +106,16 @@ export class FakeHerd implements HerdPort {
 
   homeAgents(localAgents: HomeAgent[]): HomeAgent[] {
     return [...localAgents, ...this.foreignAgents];
+  }
+
+  setPeerAgents(herdId: string, agents: HerdAgentSnapshot[]): void {
+    this.snapshots[herdId] = agents;
+  }
+
+  peerAgents(herdId: string): HerdAgentSnapshot[] {
+    return this.herds.find((row) => row.herdId === herdId && row.herdrStatus === "connected")
+      ? (this.snapshots[herdId] ?? [])
+      : [];
   }
 
   launchOptionsFor(herdId: string): HerdLaunchOptions | null {

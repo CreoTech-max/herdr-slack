@@ -18,6 +18,12 @@ export interface SlackTransport {
   postMessage(input: PostInput): Promise<{ ts: string; channel: string }>;
   history(channel: string, opts: { threadTs?: string; limit: number }): Promise<HistoryMessage[]>;
   /**
+   * A member's Slack `user.name` (`users.info`), or undefined when deleted or absent.
+   *
+   * Display text for `context` transcripts only — never an authorization input.
+   */
+  userName(userId: string): Promise<string | undefined>;
+  /**
    * A note only `user` can see, optionally inside a thread.
    *
    * Used for everything the tool says *about* itself — "reply in this thread",

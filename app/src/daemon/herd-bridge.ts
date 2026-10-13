@@ -80,8 +80,8 @@ export class HerdBridge {
   #sessions: SessionController | null = null;
   #promotionAnnounced = false;
   #splitAnnounced = false;
-  /** Cached worktrees, refreshed on the heartbeat tick for peers' launch form. */
-  #worktrees: HerdLaunchOptions["worktrees"] = [];
+  /** Cached signed worktrees per workspace for peers' launch forms. */
+  #worktreesByWorkspace: NonNullable<HerdLaunchOptions["worktreesByWorkspace"]> = {};
   readonly #peers: PeerDirectory | null;
   readonly #appIdHash: string;
 
@@ -226,7 +226,7 @@ export class HerdBridge {
           title: agent.title,
           cwd: agent.cwd,
           status: agent.status,
-          workspaceId: "",
+          workspaceId: agent.workspaceId,
           workspaceLabel: agent.workspaceLabel,
           herdId: peer.herdId,
           herdLabel: peer.label || peer.instance,
@@ -235,6 +235,14 @@ export class HerdBridge {
       }
     }
     return merged;
+  }
+
+  /** Verified agents from a live peer heartbeat. */
+  peerAgents(herdId: string): HerdAgentSnapshot[] {
+    const peer = this.registry
+      .listHeartbeats(this.deps.config.slack.appId)
+      .find((row) => row.herdId === herdId && row.herdrStatus === "connected");
+    return peer?.agents ?? [];
   }
 
   /** What a herd can launch into, for the New agent form. */
@@ -251,6 +259,8 @@ export class HerdBridge {
     herdId: string;
     ref: string;
     channel: string;
+    threadTs?: string;
+    expectedWorkspaceId?: string;
     userId: string;
     text?: string;
     launch?: HerdLaunchRequest;
@@ -262,6 +272,8 @@ export class HerdBridge {
       herdId: input.herdId,
       ref: input.ref,
       channel: input.channel,
+      ...(input.threadTs ? { threadTs: input.threadTs } : {}),
+      ...(input.expectedWorkspaceId ? { expectedWorkspaceId: input.expectedWorkspaceId } : {}),
       userId: input.userId,
       createdAt: Date.now(),
       ...(input.text !== undefined ? { text: input.text } : {}),
@@ -329,16 +341,16 @@ export class HerdBridge {
 
   async #refreshWorktrees(): Promise<void> {
     if (this.deps.tail.status !== "connected") return;
-    try {
-      const worktrees = await this.deps.client.worktreeList();
-      this.#worktrees = worktrees.map((tree) => ({
+    const byWorkspace: NonNullable<HerdLaunchOptions["worktreesByWorkspace"]> = {};
+    for (const workspaceId of this.deps.state.workspaces.keys()) {
+      const worktrees = await this.deps.client.worktreeList(workspaceId).catch(() => []);
+      byWorkspace[workspaceId] = worktrees.map((tree) => ({
         label: tree.label,
         path: tree.path,
         ...(tree.branch ? { branch: tree.branch } : {}),
       }));
-    } catch {
-      // Keep the last known list; the form degrades to typing a path.
     }
+    this.#worktreesByWorkspace = byWorkspace;
   }
 
   #localLaunchOptions(): HerdLaunchOptions {
@@ -347,7 +359,8 @@ export class HerdBridge {
         id: workspace.workspace_id,
         label: workspace.label || workspace.workspace_id,
       })),
-      worktrees: this.#worktrees,
+      worktrees: [],
+      worktreesByWorkspace: this.#worktreesByWorkspace,
       kinds: loadCatalog().map((entry) => ({ kind: entry.kind, label: entry.label })),
     };
   }
@@ -373,7 +386,10 @@ export class HerdBridge {
         title: agent.title,
         cwd: agent.cwd,
         status: agent.status,
+        name: state.nameOf(pane.terminal_id) ?? "",
+        workspaceId: pane.workspace_id,
         workspaceLabel: agent.workspaceLabel,
+        ...(record?.replyPosts ? { replyPosts: record.replyPosts } : {}),
         ...(agent.permalink ? { permalink: agent.permalink } : {}),
       });
       if (out.length >= MAX_ADVERTISED_AGENTS) break;
@@ -412,6 +428,9 @@ export class HerdBridge {
 
     const terminalId = this.deps.registry.terminalForRef(command.ref);
     if (!terminalId) return "That agent is no longer on this herd.";
+    const inWorkspace = () =>
+      !command.expectedWorkspaceId ||
+      this.deps.state.paneByTerminal(terminalId)?.workspace_id === command.expectedWorkspaceId;
 
     switch (command.op) {
       case "open_session": {
@@ -428,13 +447,33 @@ export class HerdBridge {
       }
       case "prompt": {
         if (!command.text) return "Missing prompt.";
+        if (!inWorkspace()) return "That agent is not in this workspace.";
         const baseline = await sessions.captureBaseline(terminalId);
-        const outcome = await sessions.prompt(terminalId, command.text);
+        if (!inWorkspace()) return "That agent is not in this workspace.";
+        const origin = {
+          channel: command.channel,
+          ...(command.threadTs ? { threadTs: command.threadTs } : {}),
+        };
+        const outcome = await sessions.prompt(
+          terminalId,
+          command.text,
+          command.expectedWorkspaceId,
+          origin,
+          baseline,
+        );
         if (!outcome.ok) return outcome.message;
-        this.deps.registry.startTurn(terminalId, command.text, baseline);
-        this.deps.registry.save();
         void sessions.updateCard(terminalId);
         return undefined;
+      }
+      case "stop": {
+        if (!inWorkspace()) return "That agent is not in this workspace.";
+        const outcome = await sessions.interrupt(terminalId);
+        return outcome.ok ? undefined : outcome.message;
+      }
+      case "clear": {
+        if (!inWorkspace()) return "That agent is not in this workspace.";
+        const outcome = await sessions.clear(terminalId, command.expectedWorkspaceId);
+        return outcome.ok ? undefined : outcome.message;
       }
       default:
         return "Unknown command.";
@@ -447,6 +486,7 @@ export class HerdBridge {
     // Always auto mode: a remote launch cannot answer a permission prompt.
     const entry = findEntry(loadCatalog(), request.kind);
     const mode = autoModeFor(entry);
+    let launchTurn: Awaited<ReturnType<SessionController["preparePiLaunchTurn"]>> | undefined;
     const result = await launchAgent(this.deps.client, {
       kind: request.kind,
       mode,
@@ -455,6 +495,26 @@ export class HerdBridge {
       ...(request.cwd ? { cwd: request.cwd } : {}),
       ...(request.label ? { label: request.label } : {}),
       ...(request.firstPrompt ? { firstPrompt: request.firstPrompt } : {}),
+      ...(request.firstPrompt && (entry?.command === "cre" || request.kind === "pi")
+        ? {
+            beforeFirstPrompt: async (paneId: string) => {
+              if (!(await this.deps.tail.reconcile()))
+                throw new Error("Pi session is unavailable.");
+              const terminalId = this.deps.state.terminalByPane.get(paneId);
+              if (!terminalId || !this.#sessions) throw new Error("Pi terminal is unavailable.");
+              launchTurn = await this.#sessions.preparePiLaunchTurn(
+                terminalId,
+                request.firstPrompt ?? "",
+                request.workspaceId,
+                {
+                  channel: command.channel,
+                  ...(command.threadTs ? { threadTs: command.threadTs } : {}),
+                },
+              );
+              return launchTurn.boundary;
+            },
+          }
+        : {}),
       command: entry?.command,
     });
     this.deps.log(
@@ -463,6 +523,43 @@ export class HerdBridge {
     if (!result.ok) return result.message ?? `Could not start ${request.kind}.`;
     if (result.promptDelivered === false) {
       return `Started ${request.kind}, but the first prompt did not reach it — open it and use Reply.`;
+    }
+    if (launchTurn && result.promptDelivered) {
+      if (
+        !(await this.deps.tail.reconcile()) ||
+        !(await this.#sessions?.confirmPiLaunchTurn(launchTurn))
+      )
+        return `Started ${request.kind}, but its first reply could not be verified.`;
+    } else if (request.firstPrompt && result.promptDelivered && result.paneId) {
+      await this.deps.tail.reconcile();
+      const pane = this.deps.state.paneByTerminal(
+        this.deps.state.terminalByPane.get(result.paneId) ?? "",
+      );
+      if (pane) {
+        const terminalId = pane.terminal_id;
+        this.deps.registry.upsert(terminalId, {
+          lastKnownPaneId: pane.pane_id,
+          agentKind: pane.agent ?? request.kind,
+          title: pane.terminal_title_stripped ?? pane.title ?? "",
+          cwd: pane.cwd ?? "",
+          workspaceId: pane.workspace_id,
+          tabId: pane.tab_id,
+          lastStatus: this.deps.state.statusOf(terminalId) ?? pane.agent_status,
+        });
+        this.deps.registry.startTurn(
+          terminalId,
+          request.firstPrompt,
+          "",
+          {
+            channel: command.channel,
+            ...(command.threadTs ? { threadTs: command.threadTs } : {}),
+          },
+          Date.now(),
+          result.piBoundary,
+        );
+        this.deps.registry.save();
+        if (result.piBoundary) await this.#sessions?.refreshResponse(terminalId);
+      }
     }
     return undefined;
   }

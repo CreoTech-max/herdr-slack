@@ -210,6 +210,61 @@ describe("HerdRegistry ownership", () => {
     expect(registry.takeResult("c1")).toBeNull();
   });
 
+  it("round-trips a signed stop command with its bound workspace", () => {
+    const dir = scratch();
+    const registry = openRegistry(dir);
+    const sent = command({ op: "stop", threadTs: "root", expectedWorkspaceId: "w1" });
+    registry.enqueueCommand(sent);
+    expect(registry.listCommands("h2")).toEqual([sent]);
+    const file = path.join(dir, "commands", "h2", "c1.json");
+    const envelope = JSON.parse(readFileSync(file, "utf8")) as { record: HerdCommand };
+    envelope.record.expectedWorkspaceId = "w2";
+    writeFileSync(file, `${JSON.stringify(envelope)}\n`);
+    expect(registry.listCommands("h2")).toEqual([]);
+  });
+
+  it("round-trips named agents and reply roots only from signed heartbeats", () => {
+    const dir = scratch();
+    const registry = openRegistry(dir);
+    const heartbeat = {
+      herdId: "h2",
+      label: "peer",
+      pid: 2,
+      instance: "default",
+      socketPath: "/tmp/peer.sock",
+      appId: "A1",
+      teamId: "T1",
+      herdrStatus: "connected" as const,
+      agents: [
+        {
+          ref: "opaque",
+          terminalId: "term_2",
+          agent: "claude",
+          title: "task",
+          cwd: "/app",
+          status: "idle" as const,
+          name: "build",
+          workspaceId: "w1",
+          workspaceLabel: "work",
+          replyPosts: [{ channel: "C1", ts: "root" }],
+        },
+      ],
+      updatedAt: Date.now(),
+      role: "satellite" as const,
+      hostname: "peer",
+      user: "other",
+    };
+    registry.writeHeartbeat(heartbeat);
+    expect(registry.listHeartbeats("A1")[0]?.agents[0]).toEqual(heartbeat.agents[0]);
+    const file = path.join(dir, "heartbeats", "h2.json");
+    const envelope = JSON.parse(readFileSync(file, "utf8")) as { record: typeof heartbeat };
+    const post = envelope.record.agents[0]?.replyPosts[0];
+    expect(post).toBeDefined();
+    if (post) post.ts = "forged";
+    writeFileSync(file, `${JSON.stringify(envelope)}\n`);
+    expect(registry.listHeartbeats("A1")).toEqual([]);
+  });
+
   it("abandons a command that sat too long instead of replaying it", () => {
     const registry = openRegistry();
     registry.enqueueCommand(command({ createdAt: Date.now() - COMMAND_STALE_MS - 1 }));
@@ -233,6 +288,18 @@ describe("a registry directory other accounts can write to", () => {
     new HerdRegistry(target, FOREIGN_KEY, { shared: false });
     writeFileSync(path.join(target, "c1.json"), `${JSON.stringify(forged)}\n`);
 
+    expect(registry.listCommands("h2")).toEqual([]);
+  });
+
+  it("refuses an unsigned clear command", () => {
+    const dir = scratch();
+    const registry = openRegistry(dir);
+    const target = path.join(dir, "commands", "h2");
+    new HerdRegistry(target, KEY);
+    writeFileSync(
+      path.join(target, "clear.json"),
+      `${JSON.stringify(command({ id: "clear", op: "clear" }))}\n`,
+    );
     expect(registry.listCommands("h2")).toEqual([]);
   });
 

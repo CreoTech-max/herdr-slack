@@ -85,6 +85,10 @@ export class DryRunTransport implements SlackTransport {
     return [];
   }
 
+  async userName(_userId: string): Promise<string | undefined> {
+    return undefined;
+  }
+
   async postMessage(input: PostInput): Promise<{ ts: string; channel: string }> {
     this.#record({
       api: "chat.postMessage",

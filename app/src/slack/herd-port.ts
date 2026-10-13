@@ -8,6 +8,7 @@
  */
 
 import type {
+  HerdAgentSnapshot,
   HerdCommandOp,
   HerdLaunchOptions,
   HerdLaunchRequest,
@@ -23,6 +24,8 @@ export interface HerdPort {
   homeHerds(): HomeHerd[];
   /** Local agents merged with peers', with Open values routed per herd. */
   homeAgents(localAgents: HomeAgent[]): HomeAgent[];
+  /** Verified agents from one live peer heartbeat. */
+  peerAgents(herdId: string): HerdAgentSnapshot[];
   /** What a herd can launch into, or null if it is not reporting in. */
   launchOptionsFor(herdId: string): HerdLaunchOptions | null;
   /** Queue work for another herd. Returns the command id. */
@@ -31,6 +34,8 @@ export interface HerdPort {
     herdId: string;
     ref: string;
     channel: string;
+    threadTs?: string;
+    expectedWorkspaceId?: string;
     userId: string;
     text?: string;
     launch?: HerdLaunchRequest;
