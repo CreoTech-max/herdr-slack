@@ -44,6 +44,12 @@ export interface AgentEntry {
   kind: string;
   label: string;
   modes: AgentMode[];
+  /**
+   * Typed into a fresh shell instead of `agent.start`, for agents herdr cannot
+   * start itself. Seeded only; never read from agents.toml, since it is a
+   * command line run in the user's terminal.
+   */
+  command?: string;
 }
 
 const DEFAULT_MODE: AgentMode = { id: "default", label: "Default", args: [] };
@@ -107,6 +113,8 @@ export const SEED_CATALOG: AgentEntry[] = [
     label: "Codex",
     modes: [DEFAULT_MODE, { id: "full-auto", label: "Full auto", args: ["--full-auto"] }],
   },
+  // herdr detects it as `pi` once running (T0 spike, herdr 0.9.3).
+  { kind: "cre", label: "CRE", modes: [DEFAULT_MODE], command: "cre" },
 ];
 
 export function catalogPath(): string {
@@ -122,9 +130,14 @@ export function loadCatalog(file = catalogPath()): AgentEntry[] {
     if (!overrides.has(entry.kind)) overrides.set(entry.kind, entry);
   }
 
-  return AGENT_KINDS.map(
+  const catalog: AgentEntry[] = AGENT_KINDS.map(
     (kind) => overrides.get(kind) ?? { kind, label: kind, modes: [DEFAULT_MODE] },
   );
+  for (const seed of SEED_CATALOG) {
+    if (!seed.command || (AGENT_KINDS as readonly string[]).includes(seed.kind)) continue;
+    catalog.push({ ...(overrides.get(seed.kind) ?? seed), command: seed.command });
+  }
+  return catalog;
 }
 
 /**

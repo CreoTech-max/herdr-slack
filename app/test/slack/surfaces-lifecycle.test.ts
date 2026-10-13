@@ -221,6 +221,50 @@ describe("single-card session lifecycle", () => {
     expect(turns.at(-1)?.status).toBe("done");
   });
 
+  it.each(["done", "idle"] as const)(
+    "posts a card-less turn's reply to its origin when it settles %s",
+    async (to) => {
+      fake.on("pane.read", () => ({
+        read: { text: "old screen\nPushed the fix and the build is green." },
+      }));
+      registry.startTurn("term_1", "fix it", "old screen", { channel: "C9" });
+
+      state.apply({
+        type: "pane_updated",
+        pane: pane({
+          terminal_id: "term_1",
+          pane_id: "w1:pA",
+          agent_status: "working",
+          revision: 2,
+        }),
+      });
+      state.apply({
+        type: "pane_updated",
+        pane: pane({ terminal_id: "term_1", pane_id: "w1:pA", agent_status: to, revision: 3 }),
+      });
+      await settle(60);
+
+      expect(registry.get("term_1")?.slackThreadTs).toBeUndefined();
+      expect(transport.posted.map((post) => post.channel)).toEqual(["C9"]);
+      expect(JSON.stringify(transport.posted[0])).toContain("build is green");
+    },
+  );
+
+  it("posts nothing when a card-less agent without an origin settles", async () => {
+    fake.on("pane.read", () => ({ read: { text: "Pushed the fix and the build is green." } }));
+    state.apply({
+      type: "pane_updated",
+      pane: pane({ terminal_id: "term_1", pane_id: "w1:pA", agent_status: "working", revision: 2 }),
+    });
+    state.apply({
+      type: "pane_updated",
+      pane: pane({ terminal_id: "term_1", pane_id: "w1:pA", agent_status: "done", revision: 3 }),
+    });
+    await settle(60);
+
+    expect(transport.posted).toHaveLength(0);
+  });
+
   it("records a settled response into history on manual Refresh", async () => {
     let text = "warming up";
     fake.on("pane.read", () => ({ read: { text } }));

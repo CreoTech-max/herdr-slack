@@ -265,7 +265,7 @@ export class SessionController {
     const { state, registry, client, log } = this.deps;
     const pane = state.paneByTerminal(terminalId);
     const record = registry.get(terminalId);
-    if (!pane || !record?.slackChannel || !record.slackThreadTs) return;
+    if (!pane || !record || !this.hasReplyTarget(terminalId)) return;
     if (
       !sendsTerminalText(this.deps.config.contentMode) ||
       isExcluded(pane.cwd ?? "", this.deps.config.excludePaths)
@@ -282,7 +282,11 @@ export class SessionController {
       });
     const active = registry.activeTurn(terminalId);
     const { text: safe, hits } = redact(raw);
-    const response = extractAgentResponse(safe, active?.baseline ?? record.responseBaseline);
+    const response = extractAgentResponse(
+      safe,
+      active?.baseline ?? record.responseBaseline,
+      pane.agent ?? undefined,
+    );
     if (hits.length > 0) log(`redacted ${hits.join(",")} from ${terminalId} response`);
     let settled: string | undefined;
     if (response) {
@@ -323,22 +327,31 @@ export class SessionController {
    * come back and press Refresh to discover it. This is the push: one threaded
    * message per settled turn, carrying the reply itself so the thread reads as
    * the conversation while the card stays the current state.
+   *
+   * A turn with an origin goes where its prompt came from instead, and the
+   * thread root is remembered so a reply in that thread finds this agent.
    */
   async announceReply(terminalId: string, turnId: string): Promise<void> {
     const { registry, transport, log } = this.deps;
     const record = registry.get(terminalId);
-    if (!record?.slackChannel || !record.slackThreadTs || record.ended) return;
+    if (!record || record.ended) return;
 
     const turn = registry.turns(terminalId).find((item) => item.id === turnId);
     if (!turn?.response || turn.status === "working") return;
+    const target =
+      turn.origin ??
+      (record.slackChannel && record.slackThreadTs
+        ? { channel: record.slackChannel, threadTs: record.slackThreadTs }
+        : undefined);
+    if (!target) return;
     if (!isSubstantiveResponse(turn.response)) return;
     if (!registry.claimTurnNotification(terminalId, turnId)) return;
     registry.save();
 
     try {
-      await transport.postMessage({
-        channel: record.slackChannel,
-        threadTs: record.slackThreadTs,
+      const posted = await transport.postMessage({
+        channel: target.channel,
+        ...(target.threadTs ? { threadTs: target.threadTs } : {}),
         text: replyNotice(record.agentKind, record.title, turn.status),
         blocks: [
           {
@@ -350,9 +363,21 @@ export class SessionController {
           ...responseSections(turn.response, "*Replied*"),
         ],
       });
+      if (turn.origin) {
+        registry.addReplyPost(terminalId, turn.origin.channel, turn.origin.threadTs ?? posted.ts);
+        registry.save();
+      }
     } catch (error) {
       log(`reply notice failed for ${terminalId}: ${(error as Error).message}`);
     }
+  }
+
+  /** A settled turn has somewhere to go: the card thread, or the active turn's origin. */
+  hasReplyTarget(terminalId: string): boolean {
+    const record = this.deps.registry.get(terminalId);
+    if (!record) return false;
+    if (record.slackChannel && record.slackThreadTs) return true;
+    return Boolean(this.deps.registry.activeTurn(terminalId)?.origin);
   }
 
   /** "done" when the agent is currently settled; undefined while it works. */

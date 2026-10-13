@@ -111,6 +111,8 @@ export interface AgentInfo {
   agent_status: AgentStatus;
   focused: boolean;
   revision: number;
+  /** Set by `agent.start`/`agent.rename`; null after cre's `/new` (herdr 0.9.3). */
+  name?: string | null;
   cwd?: string | null;
   foreground_cwd?: string | null;
   terminal_title?: string | null;

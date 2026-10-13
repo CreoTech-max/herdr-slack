@@ -43,13 +43,53 @@ function newSuffix(previous: string, current: string): string {
  * Without a baseline the "new region" is the entire scrollback, which is nobody's
  * reply. There the trailing prose block is the best available guess.
  */
-export function extractAgentResponse(raw: string, baseline = ""): string {
+export function extractAgentResponse(raw: string, baseline = "", agent?: string): string {
+  if (agent === "pi") return piReply(raw, baseline);
   if (baseline) {
     const delta = clean(newSuffix(baseline.trimEnd(), raw.trimEnd()));
     if (delta) return delta;
   }
   const fallback = clean(raw);
   return trailingProse(fallback) || fallback;
+}
+
+/** A full-width rule; Pi draws its editor box with two of them. */
+const PI_RULE = /^─{10,}$/u;
+
+/** Pi's screen above the editor box: banners, then the conversation. */
+function piBody(screen: string): string {
+  const lines = screen.replaceAll("\r\n", "\n").split("\n");
+  const rules = lines.flatMap((line, index) => (PI_RULE.test(line.trim()) ? [index] : []));
+  const editorTop = rules.at(-2);
+  return (editorTop === undefined ? lines : lines.slice(0, editorTop)).join("\n").trimEnd();
+}
+
+/**
+ * The reply in a Pi (cre) screen.
+ *
+ * Pi redraws in place and its footer changes every turn, so the generic diff
+ * finds no overlap and returns the whole screen. Cutting the editor box and
+ * footer off both screens first makes the old screen a prefix again. Messages
+ * are separated by two blank lines, and the new region starts with the echoed
+ * prompt, so the reply is everything after it.
+ *
+ * ponytail: layout heuristic from one captured Pi version; a structured
+ * agent.read source would replace it if herdr ever offers one.
+ */
+function piReply(raw: string, baseline: string): string {
+  const body = piBody(raw);
+  const region = baseline ? newSuffix(piBody(baseline), body) : body;
+  const messages = region
+    .split(/\n[ \t]*\n[ \t]*\n/u)
+    .map((message) => message.replace(/^\n+|\n+$/gu, ""))
+    .filter((message) => message.trim());
+  const reply = baseline ? messages.slice(1) : messages.slice(-1);
+  return reply
+    .join("\n\n")
+    .split("\n")
+    .map((line) => line.replace(/^ /u, ""))
+    .join("\n")
+    .trim();
 }
 
 /** A line that reads like a shell command, a comment, or source code. */

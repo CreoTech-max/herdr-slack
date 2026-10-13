@@ -1,5 +1,6 @@
 import type { HerdrClient } from "../herdr/client.js";
 import { HerdrError } from "../herdr/types.js";
+import { RESERVED } from "../slack/commands.js";
 import type { AgentMode } from "./catalog.js";
 
 /** How long to wait for a freshly created tab's shell to settle. */
@@ -19,6 +20,8 @@ export interface LaunchRequest {
   /** Unique among live agents; herdr enforces [a-z][a-z0-9_-]{0,31}. */
   name: string;
   firstPrompt?: string;
+  /** Typed into the shell instead of `agent.start` (catalog `command`). */
+  command?: string | undefined;
 }
 
 export interface LaunchResult {
@@ -39,6 +42,7 @@ const LABEL_ATTEMPTS = 50;
 
 /** Whether herdr refused because the name is already taken by a live agent. */
 function isNameTaken(error: unknown): boolean {
+  if (error instanceof HerdrError && error.code === "agent_name_taken") return true;
   const message = error instanceof HerdrError ? error.message : "";
   return /already used|already in use|name.*taken/i.test(message);
 }
@@ -111,6 +115,11 @@ export async function launchAgent(
     sleep = defaultSleep,
   } = options;
 
+  // A name equal to a mention command could never be addressed as an agent.
+  if ((RESERVED as readonly string[]).includes(request.name)) {
+    return { ok: false, message: `${request.name} is a command word; pick another name.` };
+  }
+
   const label = request.label ? await freeTabLabel(client, request.label) : "";
 
   let paneId: string;
@@ -135,13 +144,30 @@ export async function launchAgent(
 
   await waitForShell(client, paneId, readyTimeoutMs, sleep);
 
-  const start = (name: string) =>
-    client.request("agent.start", {
-      name,
-      kind: request.kind,
-      pane_id: paneId,
-      ...(request.mode.args.length > 0 ? { args: request.mode.args } : {}),
-    });
+  let start: (name: string) => Promise<unknown>;
+  if (request.command) {
+    try {
+      await client.request("pane.send_text", { pane_id: paneId, text: `${request.command}\n` });
+    } catch (error) {
+      return {
+        ok: false,
+        paneId,
+        tabId,
+        message: explain(error, `could not start ${request.kind}`),
+      };
+    }
+    // A typed agent has no name until herdr detects it and we rename it.
+    await waitForAgentReady(client, paneId, agentReadyTimeoutMs, sleep);
+    start = (name) => client.request("agent.rename", { target: paneId, name });
+  } else {
+    start = (name) =>
+      client.request("agent.start", {
+        name,
+        kind: request.kind,
+        pane_id: paneId,
+        ...(request.mode.args.length > 0 ? { args: request.mode.args } : {}),
+      });
+  }
 
   const attempt = await startWithFreeName(start, request.name, sleep);
   if (!attempt.name) {

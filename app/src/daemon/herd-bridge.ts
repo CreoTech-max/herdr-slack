@@ -445,7 +445,8 @@ export class HerdBridge {
     const request = command.launch;
     if (!request?.kind) return "Missing agent kind.";
     // Always auto mode: a remote launch cannot answer a permission prompt.
-    const mode = autoModeFor(findEntry(loadCatalog(), request.kind));
+    const entry = findEntry(loadCatalog(), request.kind);
+    const mode = autoModeFor(entry);
     const result = await launchAgent(this.deps.client, {
       kind: request.kind,
       mode,
@@ -454,6 +455,7 @@ export class HerdBridge {
       ...(request.cwd ? { cwd: request.cwd } : {}),
       ...(request.label ? { label: request.label } : {}),
       ...(request.firstPrompt ? { firstPrompt: request.firstPrompt } : {}),
+      command: entry?.command,
     });
     this.deps.log(
       `remote launch ${request.kind} → ${result.ok ? "ok" : "failed"} pane=${result.paneId ?? "?"}`,

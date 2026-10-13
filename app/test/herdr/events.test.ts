@@ -191,6 +191,93 @@ describe("EventTail", () => {
     expect(state.paneByTerminal("term_snap")).toBeDefined();
   });
 
+  describe("per-pane agent status", () => {
+    // Verified live (herdr 0.9.3, T0): a cre/pi turn's working → done reaches
+    // only the per-pane `pane.agent_status_changed` subscription; the global
+    // pane.updated stream stayed idle, so turns settled only on the 30s reconcile.
+    const statusEvent = (paneId: string, agent_status: string) =>
+      JSON.stringify({
+        event: "pane.agent_status_changed",
+        data: { agent: "pi", agent_status, pane_id: paneId, workspace_id: "w1" },
+      });
+    const paneSubscriptions = () =>
+      fake.requests
+        .filter((r) => r.method === "events.subscribe")
+        .flatMap((r) => r.params.subscriptions as { type: string; pane_id?: string }[])
+        .filter((s) => s.type === "pane.agent_status_changed");
+
+    const primeWith = async (panes: ReturnType<typeof pane>[]) => {
+      state.dispose();
+      state = new SessionState({ done: 0, idle: 0 });
+      tail = new EventTail(new HerdrClient(fake.socketPath, 1_000), state);
+      fake.on("session.snapshot", () => ({ snapshot: snapshot({ panes }) }));
+      tail.start();
+      await waitFor(() => fake.subscriberCount === 1);
+      fake.emitSubscriptionStarted();
+      await waitFor(() => state.primed);
+      await settle(100);
+    };
+
+    it("subscribes each agent pane on its own connection, and no plain shell", async () => {
+      await primeWith([
+        pane({ terminal_id: "term_cre", pane_id: "w1:pA", agent: "pi", agent_status: "idle" }),
+        pane({ terminal_id: "term_sh", pane_id: "w1:pB", agent: null, agent_status: "unknown" }),
+      ]);
+
+      expect(paneSubscriptions()).toEqual([
+        { type: "pane.agent_status_changed", pane_id: "w1:pA" },
+      ]);
+      expect(fake.subscriberCount).toBe(2);
+    });
+
+    it("settles a turn from per-pane events without waiting for a reconcile", async () => {
+      await primeWith([
+        pane({ terminal_id: "term_cre", pane_id: "w1:pA", agent: "pi", agent_status: "idle" }),
+      ]);
+      const seen: StatusTransition[] = [];
+      state.on("transition", (t) => seen.push(t));
+      const snapshots = fake.requests.filter((r) => r.method === "session.snapshot").length;
+
+      fake.emitRaw(statusEvent("w1:pA", "working"));
+      await settle(50);
+      fake.emitRaw(statusEvent("w1:pA", "done"));
+      await settle(50);
+
+      expect(seen.map((t) => [t.terminalId, t.to])).toEqual([
+        ["term_cre", "working"],
+        ["term_cre", "done"],
+      ]);
+      expect(fake.requests.filter((r) => r.method === "session.snapshot")).toHaveLength(snapshots);
+    });
+
+    it("ignores per-pane events for an unknown pane or an unknown status", async () => {
+      await primeWith([
+        pane({ terminal_id: "term_cre", pane_id: "w1:pA", agent: "pi", agent_status: "idle" }),
+      ]);
+      const seen: StatusTransition[] = [];
+      state.on("transition", (t) => seen.push(t));
+
+      fake.emitRaw(statusEvent("w1:pZ", "working"));
+      fake.emitRaw(statusEvent("w1:pA", "exploded"));
+      await settle(50);
+
+      expect(seen).toEqual([]);
+      expect(state.statusOf("term_cre")).toBe("idle");
+    });
+
+    it("drops the subscription when the agent pane goes away", async () => {
+      await primeWith([
+        pane({ terminal_id: "term_cre", pane_id: "w1:pA", agent: "pi", agent_status: "idle" }),
+      ]);
+      expect(fake.subscriberCount).toBe(2);
+
+      fake.emitEvent({ type: "pane_closed", pane_id: "w1:pA", workspace_id: "w1" });
+      await settle(100);
+
+      expect(fake.subscriberCount).toBe(1);
+    });
+  });
+
   it("reports a failed reconcile instead of throwing", async () => {
     tail.start();
     await waitFor(() => fake.subscriberCount === 1);

@@ -2,7 +2,12 @@ import { EventEmitter } from "node:events";
 import net from "node:net";
 import type { HerdrClient } from "./client.js";
 import type { SessionState } from "./state.js";
-import { type EventEnvelope, GLOBAL_SUBSCRIPTIONS } from "./types.js";
+import {
+  AGENT_STATUSES,
+  type AgentStatus,
+  type EventEnvelope,
+  GLOBAL_SUBSCRIPTIONS,
+} from "./types.js";
 
 /** Full reconcile cadence — a safety net against a missed or malformed event. */
 const RECONCILE_INTERVAL_MS = 30_000;
@@ -35,6 +40,15 @@ export interface EventTailEvents {
  */
 export class EventTail extends EventEmitter<EventTailEvents> {
   #socket: net.Socket | null = null;
+  /**
+   * One `pane.agent_status_changed` subscription per agent pane, by pane id.
+   *
+   * Verified live (herdr 0.9.3): cre/pi working → done arrives only here, not on
+   * the global pane.updated stream. Each pane gets its own connection because a
+   * second `events.subscribe` on one connection resets it, and one stale pane id
+   * fails the whole request with `pane_not_found`.
+   */
+  #paneSockets = new Map<string, net.Socket>();
   #reconnectTimer: NodeJS.Timeout | null = null;
   #reconcileTimer: NodeJS.Timeout | null = null;
   #attempt = 0;
@@ -54,6 +68,7 @@ export class EventTail extends EventEmitter<EventTailEvents> {
 
   start(): void {
     this.#stopped = false;
+    this.state.on("changed", this.#syncPaneSubscriptions);
     this.#connect();
     this.#reconcileTimer = setInterval(() => {
       void this.reconcile();
@@ -69,6 +84,9 @@ export class EventTail extends EventEmitter<EventTailEvents> {
     this.#reconcileTimer = null;
     this.#socket?.destroy();
     this.#socket = null;
+    this.state.off("changed", this.#syncPaneSubscriptions);
+    for (const socket of this.#paneSockets.values()) socket.destroy();
+    this.#paneSockets.clear();
   }
 
   /** Pull a full snapshot and overwrite the projection. */
@@ -98,7 +116,6 @@ export class EventTail extends EventEmitter<EventTailEvents> {
 
     const socket = net.createConnection(this.client.socketPath);
     this.#socket = socket;
-    let buffer = "";
 
     socket.on("connect", () => {
       this.#attempt = 0;
@@ -112,16 +129,7 @@ export class EventTail extends EventEmitter<EventTailEvents> {
       this.#setStatus("connected");
     });
 
-    socket.on("data", (chunk) => {
-      buffer += chunk.toString("utf8");
-      let newline = buffer.indexOf("\n");
-      while (newline >= 0) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (line) this.#handleLine(line);
-        newline = buffer.indexOf("\n");
-      }
-    });
+    onLines(socket, (line) => this.#handleLine(line));
 
     const restart = (reason: string) => {
       if (this.#socket !== socket) return;
@@ -132,6 +140,64 @@ export class EventTail extends EventEmitter<EventTailEvents> {
 
     socket.on("error", (error) => restart(error.message));
     socket.on("close", () => restart("connection closed"));
+  }
+
+  /** Follow the current agent panes: subscribe new ones, drop gone ones. */
+  #syncPaneSubscriptions = (): void => {
+    if (this.#stopped) return;
+    const wanted = new Set(this.state.agentPanes().map((pane) => pane.pane_id));
+    for (const [paneId, socket] of this.#paneSockets) {
+      if (wanted.has(paneId)) continue;
+      this.#paneSockets.delete(paneId);
+      socket.destroy();
+    }
+    for (const paneId of wanted) {
+      if (!this.#paneSockets.has(paneId)) this.#subscribePane(paneId);
+    }
+  };
+
+  /**
+   * A failed or closed pane connection is simply forgotten; the next state
+   * change (at worst the 30s reconcile) subscribes again if the pane still has
+   * an agent.
+   */
+  #subscribePane(paneId: string): void {
+    const socket = net.createConnection(this.client.socketPath);
+    this.#paneSockets.set(paneId, socket);
+    const drop = () => {
+      if (this.#paneSockets.get(paneId) === socket) this.#paneSockets.delete(paneId);
+      socket.destroy();
+    };
+    socket.on("connect", () => {
+      socket.write(
+        `${JSON.stringify({
+          id: `sub_${paneId}`,
+          method: "events.subscribe",
+          params: { subscriptions: [{ type: "pane.agent_status_changed", pane_id: paneId }] },
+        })}\n`,
+      );
+    });
+    onLines(socket, (line) => {
+      let message: unknown;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (typeof message !== "object" || message === null) return;
+      const record = message as { error?: unknown; event?: unknown; data?: unknown };
+      if (record.error) {
+        drop();
+        return;
+      }
+      if (record.event !== "pane.agent_status_changed") return;
+      const data = record.data as { pane_id?: unknown; agent_status?: unknown } | undefined;
+      const status = data?.agent_status;
+      if (data?.pane_id !== paneId || !AGENT_STATUSES.includes(status as AgentStatus)) return;
+      this.state.applyAgentStatus(paneId, status as AgentStatus);
+    });
+    socket.on("error", drop);
+    socket.on("close", drop);
   }
 
   #handleLine(line: string): void {
@@ -210,4 +276,19 @@ export class EventTail extends EventEmitter<EventTailEvents> {
     }, delay);
     this.#reconnectTimer.unref?.();
   }
+}
+
+/** Feed each complete ndjson line of a socket to `handle`. */
+function onLines(socket: net.Socket, handle: (line: string) => void): void {
+  let buffer = "";
+  socket.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (line) handle(line);
+      newline = buffer.indexOf("\n");
+    }
+  });
 }

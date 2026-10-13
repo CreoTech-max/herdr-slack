@@ -58,6 +58,8 @@ export class SessionState extends EventEmitter<SessionStateEvents> {
   /** Status we have actually announced, per terminal. */
   readonly #committed = new Map<string, AgentStatus>();
   readonly #pending = new Map<string, NodeJS.Timeout>();
+  /** terminal_id → agent name. Only snapshots carry it; no event does. */
+  readonly #names = new Map<string, string>();
 
   /** Suppress transition emissions until connect-time replay finishes. */
   #primed = false;
@@ -78,6 +80,11 @@ export class SessionState extends EventEmitter<SessionStateEvents> {
 
   statusOf(terminalId: string): AgentStatus | undefined {
     return this.#committed.get(terminalId);
+  }
+
+  /** herdr's agent name (`agent.rename`), refreshed from each snapshot. */
+  nameOf(terminalId: string): string | undefined {
+    return this.#names.get(terminalId);
   }
 
   paneByTerminal(terminalId: string): PaneInfo | undefined {
@@ -110,6 +117,10 @@ export class SessionState extends EventEmitter<SessionStateEvents> {
     }
     for (const terminalId of [...this.panes.keys()]) {
       if (!seen.has(terminalId)) this.#removeTerminal(terminalId);
+    }
+    this.#names.clear();
+    for (const agent of snapshot.agents ?? []) {
+      if (agent.name) this.#names.set(agent.terminal_id, agent.name);
     }
     this.emit("changed");
   }
@@ -180,6 +191,19 @@ export class SessionState extends EventEmitter<SessionStateEvents> {
       default:
         break;
     }
+  }
+
+  /**
+   * Apply a per-pane `pane.agent_status_changed` event.
+   *
+   * The event carries no terminal_id or revision, so it only moves the status
+   * of a pane we already know; anything else waits for the next reconcile.
+   */
+  applyAgentStatus(paneId: string, status: AgentStatus): void {
+    const terminalId = this.terminalByPane.get(paneId);
+    const pane = terminalId ? this.panes.get(terminalId) : undefined;
+    if (!pane || pane.agent_status === status) return;
+    this.#upsertPane({ ...pane, agent_status: status });
   }
 
   /** Cancel pending debounce timers. Call on shutdown so the process can exit. */
@@ -280,6 +304,7 @@ export class SessionState extends EventEmitter<SessionStateEvents> {
     if (pane) this.terminalByPane.delete(pane.pane_id);
     this.panes.delete(terminalId);
     this.#committed.delete(terminalId);
+    this.#names.delete(terminalId);
     const timer = this.#pending.get(terminalId);
     if (timer) {
       clearTimeout(timer);

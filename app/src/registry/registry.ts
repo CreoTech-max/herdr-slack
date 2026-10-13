@@ -23,6 +23,8 @@ export interface SessionTurn {
    * earlier design re-announced settled agents on a loop.
    */
   notifiedAt?: number;
+  /** Where the prompt came from; the settled reply is posted there. */
+  origin?: { channel: string; threadTs?: string };
 }
 
 export interface SessionRecord {
@@ -66,6 +68,8 @@ export interface SessionRecord {
   responseBaseline?: string;
   /** A user-ended remote session must not be revived just because the pane still exists. */
   closedByUser?: boolean;
+  /** Thread roots of posted replies, so a thread reply finds its agent. Newest last. */
+  replyPosts?: { channel: string; ts: string }[];
 }
 
 export function registryPath(instance: string): string {
@@ -167,6 +171,7 @@ export class SessionRegistry {
     terminalId: string,
     prompt: string,
     baseline: string,
+    origin?: SessionTurn["origin"],
     now = Date.now(),
   ): SessionTurn | undefined {
     const record = this.#byTerminal.get(terminalId);
@@ -177,6 +182,7 @@ export class SessionRegistry {
       status: "working",
       createdAt: now,
       ...(baseline ? { baseline } : {}),
+      ...(origin ? { origin } : {}),
     };
     record.turns = [...(record.turns ?? []), turn].slice(-20);
     return turn;
@@ -189,7 +195,7 @@ export class SessionRegistry {
   updateTurn(
     terminalId: string,
     turnId: string,
-    fields: Partial<Pick<SessionTurn, "response" | "status" | "completedAt">>,
+    fields: Partial<Pick<SessionTurn, "response" | "status" | "completedAt" | "origin">>,
   ): void {
     const turns = this.#byTerminal.get(terminalId)?.turns;
     const index = turns?.findIndex((item) => item.id === turnId) ?? -1;
@@ -207,6 +213,8 @@ export class SessionRegistry {
             ...(updated.completedAt === undefined ? {} : { completedAt: updated.completedAt }),
             // Dropping this would re-announce the turn on the next settle.
             ...(updated.notifiedAt === undefined ? {} : { notifiedAt: updated.notifiedAt }),
+            // Dropping this would post the reply to the card instead of where it was asked.
+            ...(updated.origin === undefined ? {} : { origin: updated.origin }),
           }
         : updated;
   }
@@ -217,6 +225,25 @@ export class SessionRegistry {
     if (!turn || turn.notifiedAt !== undefined) return false;
     turn.notifiedAt = now;
     return true;
+  }
+
+  /** The terminal whose posted reply has this thread root, if any. */
+  terminalForReplyPost(channel: string, ts: string): string | undefined {
+    for (const [terminalId, record] of this.#byTerminal) {
+      if (record.replyPosts?.some((post) => post.channel === channel && post.ts === ts)) {
+        return terminalId;
+      }
+    }
+    return undefined;
+  }
+
+  addReplyPost(terminalId: string, channel: string, ts: string): void {
+    const record = this.#byTerminal.get(terminalId);
+    if (!record) return;
+    const others = (record.replyPosts ?? []).filter(
+      (post) => post.channel !== channel || post.ts !== ts,
+    );
+    record.replyPosts = [...others, { channel, ts }].slice(-20);
   }
 
   setLatestResponse(terminalId: string, response: string): void {

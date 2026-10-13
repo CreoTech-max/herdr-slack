@@ -241,6 +241,59 @@ describe("SessionState", () => {
     });
   });
 
+  describe("agent names", () => {
+    // `name` is on session.snapshot agents[] (T0, herdr 0.9.3); no event carries it.
+    const agent = (p: ReturnType<typeof pane>, name?: string | null) => ({
+      pane_id: p.pane_id,
+      terminal_id: p.terminal_id,
+      workspace_id: p.workspace_id,
+      tab_id: p.tab_id,
+      agent: "pi",
+      agent_status: p.agent_status,
+      focused: false,
+      revision: p.revision,
+      ...(name === undefined ? {} : { name }),
+    });
+
+    it("knows each agent's herdr name from the snapshot", () => {
+      const named = pane({ terminal_id: "term_named" });
+      const bare = pane({ terminal_id: "term_bare" });
+      const cleared = pane({ terminal_id: "term_cleared" });
+
+      state.applySnapshot(
+        snapshot({
+          panes: [named, bare, cleared],
+          agents: [agent(named, "build"), agent(bare), agent(cleared, null)],
+        }),
+      );
+
+      expect(state.nameOf("term_named")).toBe("build");
+      expect(state.nameOf("term_bare")).toBeUndefined();
+      expect(state.nameOf("term_cleared")).toBeUndefined();
+      expect(state.nameOf("term_unknown")).toBeUndefined();
+    });
+
+    it("follows a rename and forgets a name herdr dropped", () => {
+      const p = pane({ terminal_id: "term_r" });
+      state.applySnapshot(snapshot({ panes: [p], agents: [agent(p, "old")] }));
+      state.applySnapshot(snapshot({ panes: [p], agents: [agent(p, "new")] }));
+      expect(state.nameOf("term_r")).toBe("new");
+
+      // `/new` in cre clears the herdr name (T0 step 6).
+      state.applySnapshot(snapshot({ panes: [p], agents: [agent(p)] }));
+      expect(state.nameOf("term_r")).toBeUndefined();
+    });
+
+    it("forgets the name when the terminal goes away", () => {
+      const p = pane({ terminal_id: "term_gone" });
+      state.applySnapshot(snapshot({ panes: [p], agents: [agent(p, "gone")] }));
+
+      state.apply({ type: "pane_closed", pane_id: p.pane_id, workspace_id: "w1" });
+
+      expect(state.nameOf("term_gone")).toBeUndefined();
+    });
+  });
+
   it("lists only panes running an agent", () => {
     state.apply({ type: "pane_created", pane: pane({ agent: "claude" }) });
     state.apply({ type: "pane_created", pane: pane({ agent: null }) });

@@ -25,7 +25,8 @@ describe("catalog", () => {
 
   it("offers every kind herdr can start", () => {
     const catalog = loadCatalog(file);
-    expect(catalog).toHaveLength(AGENT_KINDS.length);
+    // + the typed `cre` entry, which herdr cannot start itself.
+    expect(catalog).toHaveLength(AGENT_KINDS.length + 1);
     expect(catalog.map((e) => e.kind)).toContain("claude");
     expect(catalog.map((e) => e.kind)).toContain("qodercli");
   });
@@ -103,6 +104,20 @@ describe("catalog", () => {
       "--permission-mode",
       "plan",
     ]);
+  });
+
+  it("offers cre, launched by typing its command", () => {
+    expect(findEntry(loadCatalog(file), "cre")).toMatchObject({ kind: "cre", command: "cre" });
+  });
+
+  it("keeps cre's command when agents.toml overrides its label", () => {
+    // The command is not read from TOML; a user entry must not erase it.
+    writeFileSync(file, '[cre]\nlabel = "My CRE"\ncommand = "rm -rf /"\n');
+    expect(findEntry(loadCatalog(file), "cre")).toMatchObject({ label: "My CRE", command: "cre" });
+  });
+
+  it("gives herdr-native kinds no command", () => {
+    expect(findEntry(loadCatalog(file), "claude")?.command).toBeUndefined();
   });
 
   it("does not overwrite an existing catalog", () => {

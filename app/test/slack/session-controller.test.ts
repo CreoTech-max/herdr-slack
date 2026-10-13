@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -229,6 +229,78 @@ describe("SessionController", () => {
       // No pane.read handler → unknown_method; the recap must degrade, not throw.
       const result = await controller.openSession("term_1", "D1");
       expect(result.ok).toBe(true);
+    });
+  });
+
+  describe("origin-routed replies", () => {
+    const settleWith = async (origin?: { channel: string; threadTs?: string }) => {
+      withAgent();
+      fake.on("pane.read", () => ({
+        read: { text: "old screen\nImplemented the requested change in full." },
+      }));
+      registry.startTurn("term_1", "make the change", "old screen", origin);
+      await controller.refreshResponse("term_1", "done");
+    };
+
+    it("posts a settled turn once, top-level in its origin channel", async () => {
+      await settleWith({ channel: "C1" });
+      await controller.refreshResponse("term_1", "done");
+
+      expect(transport.posted).toHaveLength(1);
+      expect(transport.posted[0]?.channel).toBe("C1");
+      expect(transport.posted[0]?.threadTs).toBeUndefined();
+      expect(JSON.stringify(transport.posted[0]?.blocks)).toContain("Implemented the requested");
+      expect(registry.get("term_1")?.replyPosts).toEqual([{ channel: "C1", ts: "ts_1" }]);
+      expect(registry.terminalForReplyPost("C1", "ts_1")).toBe("term_1");
+    });
+
+    it("answers in the origin thread and records the thread root", async () => {
+      await settleWith({ channel: "C1", threadTs: "5.5" });
+
+      expect(transport.posted[0]).toMatchObject({ channel: "C1", threadTs: "5.5" });
+      expect(registry.get("term_1")?.replyPosts).toEqual([{ channel: "C1", ts: "5.5" }]);
+    });
+
+    it("posts nothing for a turn with no origin and no card", async () => {
+      await settleWith();
+      expect(transport.posted).toHaveLength(0);
+    });
+
+    it("extracts a cre (pi) reply from its redrawn screen", async () => {
+      const screen = (name: string) =>
+        readFileSync(new URL(`fixtures/${name}.txt`, import.meta.url), "utf8");
+      state.apply({
+        type: "pane_created",
+        pane: pane({ terminal_id: "term_cre", pane_id: "w1:pC", agent: "pi" }),
+      });
+      registry.upsert("term_cre", {
+        lastKnownPaneId: "w1:pC",
+        agentKind: "pi",
+        title: "cre",
+        cwd: "/w",
+        workspaceId: "w1",
+        tabId: "w1:t1",
+        lastStatus: "working",
+      });
+      fake.on("pane.read", () => ({ read: { text: screen("cre-turn2") } }));
+      registry.startTurn("term_cre", "say it", screen("cre-turn1"), { channel: "C1" });
+
+      await controller.refreshResponse("term_cre", "done");
+
+      expect(registry.turns("term_cre")[0]?.response).toBe("ALPHA BRAVO CHARLIE");
+      expect(JSON.stringify(transport.posted)).not.toContain("Update Available");
+    });
+
+    it("posts nothing for an ended session", async () => {
+      withAgent();
+      const turn = registry.startTurn("term_1", "go", "", { channel: "C1" });
+      registry.updateTurn("term_1", turn?.id ?? "", {
+        status: "done",
+        response: "Implemented the requested change in full.",
+      });
+      registry.markEnded("term_1");
+      await controller.announceReply("term_1", turn?.id ?? "");
+      expect(transport.posted).toHaveLength(0);
     });
   });
 

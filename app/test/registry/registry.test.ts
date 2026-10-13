@@ -112,6 +112,54 @@ describe("SessionRegistry", () => {
     const registry = new SessionRegistry("default");
     expect(() => registry.setThread("ghost", "D1", "1")).not.toThrow();
   });
+
+  it("keeps a turn's origin through start, steer and settle", () => {
+    const registry = new SessionRegistry("default");
+    registry.upsert("term_1", fields());
+    const turn = registry.startTurn("term_1", "hi", "", { channel: "C1" });
+    expect(turn?.origin).toEqual({ channel: "C1" });
+
+    registry.updateTurn("term_1", turn?.id ?? "", { origin: { channel: "C2", threadTs: "9.1" } });
+    registry.updateTurn("term_1", turn?.id ?? "", {
+      status: "done",
+      response: "all done here",
+      completedAt: 5,
+    });
+
+    expect(registry.turns("term_1")[0]?.origin).toEqual({ channel: "C2", threadTs: "9.1" });
+  });
+
+  it("resolves a reply post back to its terminal and survives a restart", () => {
+    const registry = new SessionRegistry("default");
+    registry.upsert("term_1", fields());
+    registry.addReplyPost("term_1", "C1", "1.1");
+    registry.addReplyPost("term_1", "C1", "1.1");
+    registry.save();
+
+    const reloaded = new SessionRegistry("default");
+    reloaded.load();
+    expect(reloaded.terminalForReplyPost("C1", "1.1")).toBe("term_1");
+    expect(reloaded.get("term_1")?.replyPosts).toEqual([{ channel: "C1", ts: "1.1" }]);
+  });
+
+  it("does not resolve a reply post it never recorded", () => {
+    const registry = new SessionRegistry("default");
+    registry.upsert("term_1", fields());
+    registry.addReplyPost("term_1", "C1", "1.1");
+    registry.addReplyPost("ghost", "C1", "2.2");
+    expect(registry.terminalForReplyPost("C1", "2.2")).toBeUndefined();
+    expect(registry.terminalForReplyPost("C2", "1.1")).toBeUndefined();
+  });
+
+  it("keeps only the latest twenty reply posts", () => {
+    const registry = new SessionRegistry("default");
+    registry.upsert("term_1", fields());
+    for (let index = 0; index < 22; index += 1) registry.addReplyPost("term_1", "C1", `${index}`);
+    const posts = registry.get("term_1")?.replyPosts ?? [];
+    expect(posts).toHaveLength(20);
+    expect(posts[0]?.ts).toBe("2");
+    expect(registry.terminalForReplyPost("C1", "0")).toBeUndefined();
+  });
 });
 
 describe("sweepOrphans", () => {

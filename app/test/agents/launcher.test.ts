@@ -395,6 +395,99 @@ describe("launchAgent", () => {
   });
 
   /**
+   * herdr cannot start cre (`agent.start` has no command override), so it is
+   * typed into the fresh shell, detected as `pi`, then named with agent.rename.
+   * Verified live in the T0 spike against herdr 0.9.3.
+   */
+  describe("typed launch", () => {
+    const typed = (overrides = {}) =>
+      request({
+        kind: "cre",
+        command: "cre",
+        mode: { id: "default", label: "D", args: [] },
+        ...overrides,
+      });
+    const methods = () => fake.requests.map((r) => r.method);
+
+    beforeEach(() => {
+      tabCreates();
+      fake.on("pane.process_info", () => ({ process: { foreground_command: null } }));
+      fake.on("pane.send_text", () => ({ ok: true }));
+      fake.on("agent.get", () => ({ agent: { agent: "pi" } }));
+      fake.on("agent.wait", () => ({ ok: true }));
+      fake.on("agent.prompt", () => ({ ok: true }));
+    });
+
+    it("types the command, then names the agent, and never calls agent.start", async () => {
+      fake.on("agent.rename", () => ({ agent: { name: "worker" } }));
+
+      const result = await launchAgent(client, typed(), { sleep: noSleep });
+
+      expect(result).toMatchObject({ ok: true, paneId: "w1:p9", tabId: "w1:t9" });
+      expect(fake.requests.find((r) => r.method === "pane.send_text")?.params).toEqual({
+        pane_id: "w1:p9",
+        text: "cre\n",
+      });
+      expect(fake.requests.find((r) => r.method === "agent.rename")?.params).toEqual({
+        target: "w1:p9",
+        name: "worker",
+      });
+      expect(methods()).not.toContain("agent.start");
+      const order = methods();
+      expect(order.indexOf("pane.send_text")).toBeLessThan(order.indexOf("agent.get"));
+      expect(order.indexOf("agent.get")).toBeLessThan(order.indexOf("agent.rename"));
+    });
+
+    it("walks to a free name when the requested one is taken", async () => {
+      const tried: string[] = [];
+      fake.on("agent.rename", (params) => {
+        tried.push(String(params.name));
+        return params.name === "build"
+          ? Object.assign(new Error("refused"), { code: "agent_name_taken" })
+          : { agent: { name: params.name } };
+      });
+
+      const result = await launchAgent(client, typed({ name: "build" }), { sleep: noSleep });
+
+      expect(result.ok).toBe(true);
+      expect(tried).toEqual(["build", "build-2"]);
+    });
+
+    it("sends the first prompt only after the agent has its name", async () => {
+      fake.on("agent.rename", () => ({ agent: { name: "worker" } }));
+
+      const result = await launchAgent(client, typed({ firstPrompt: "go" }), { sleep: noSleep });
+
+      expect(result.promptDelivered).toBe(true);
+      expect(methods().indexOf("agent.rename")).toBeLessThan(methods().indexOf("agent.prompt"));
+    });
+
+    it("reports a shell that will not take the command", async () => {
+      fake.on("pane.send_text", () => new Error("pane is gone"));
+
+      const result = await launchAgent(client, typed(), { sleep: noSleep });
+
+      expect(result).toMatchObject({ ok: false, paneId: "w1:p9" });
+      expect(result.message).toContain("could not start cre");
+      expect(methods()).not.toContain("agent.rename");
+    });
+  });
+
+  it.each(["bind", "unbind", "agents", "new", "help"])(
+    "refuses the command word %s as a name before creating a tab",
+    async (name) => {
+      tabCreates();
+      const result = await launchAgent(client, request({ name }), { sleep: noSleep });
+
+      expect(result).toEqual({
+        ok: false,
+        message: `${name} is a command word; pick another name.`,
+      });
+      expect(fake.requests.some((r) => r.method === "tab.create")).toBe(false);
+    },
+  );
+
+  /**
    * herdr accepts a duplicate label without complaint, and two tabs with the
    * same name are indistinguishable in Home, in the terminal, and in thread
    * titles. Unlike agent names, nothing else catches this.

@@ -162,6 +162,25 @@ describe("Surfaces commands and launching", () => {
       });
     });
 
+    it("launches cre by typing its catalog command instead of agent.start", async () => {
+      wireLaunch();
+      fake.on("pane.send_text", () => ({ ok: true }));
+      fake.on("agent.rename", () => ({ agent: { name: "cre" } }));
+
+      await transport.emitViewSubmit({
+        ctx: ctx(),
+        callbackId: MODAL_IDS.newAgent,
+        view: submission({
+          [BLOCK_IDS.kind]: { [ACTION_IDS.kind]: { selected_option: { value: "cre" } } },
+        }),
+      });
+
+      expect(fake.requests.find((r) => r.method === "pane.send_text")?.params).toMatchObject({
+        text: "cre\n",
+      });
+      expect(fake.requests.some((r) => r.method === "agent.start")).toBe(false);
+    });
+
     it("reports a launch failure in words", async () => {
       fake.on("tab.create", () => new Error("no such workspace"));
 

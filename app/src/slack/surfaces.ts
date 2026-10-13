@@ -249,7 +249,7 @@ export class Surfaces {
    */
   async #onTransition(terminalId: string, to: AgentStatus, from?: AgentStatus): Promise<void> {
     const record = this.deps.registry.get(terminalId);
-    if (!record?.slackThreadTs || !record.slackChannel || record.ended) return;
+    if (!record || record.ended || !this.#sessions.hasReplyTarget(terminalId)) return;
     if (!isEligibleCreRoot(this.deps.config, this.deps.state.paneByTerminal(terminalId))) return;
 
     if (to === "working" || to === "unknown") {
@@ -327,7 +327,7 @@ export class Surfaces {
       if (!pane || pane.agent_status !== "idle" || !isEligibleCreRoot(this.deps.config, pane))
         return;
       const record = this.deps.registry.get(terminalId);
-      if (!record?.slackThreadTs || !record.slackChannel || record.ended) return;
+      if (!record || record.ended || !this.#sessions.hasReplyTarget(terminalId)) return;
       void this.#sessions.refreshResponse(terminalId, "done");
     }, this.#cursorIdleDelayMs());
     timer.unref?.();
@@ -589,6 +589,7 @@ export class Surfaces {
       ...(submission.cwd ? { cwd: submission.cwd } : {}),
       ...(submission.label ? { label: submission.label } : {}),
       ...(submission.firstPrompt ? { firstPrompt: submission.firstPrompt } : {}),
+      command: entry?.command,
     });
 
     // The outcome message is the only record of a first prompt that was lost,
